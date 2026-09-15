@@ -1,0 +1,28 @@
+/target
+.env
+.env.*
+!.env.example
+.envrc
+
+# Credentials. token.json, its temp files, .token.lock and bearer.token appear
+# wherever TODO_MCP_DATA_DIR points, which may be inside this checkout. Never
+# redirect `token` output into a file here; if you do, these names are ignored.
+.bearer
+*.bearer
+.mcp.json
+token.json
+token.json.tmp.*
+bearer.token
+.token.lock
+.todo-mcp/
+/data/
+
+# Local tooling
+# docs/footprint.md's ELF check exports binaries here.
+/release-out/
+
+.DS_Store
+*.log
+.vscode/
+.idea/
+.claude/settings.local.json

@@ -1,0 +1,28 @@
+# stdout is owned exclusively by src/cli/out.rs. `token` is captured by shell
+# substitution into an Authorization header, so a stray println! anywhere else
+# would silently corrupt a bearer token rather than merely being untidy.
+disallowed-macros = [
+    { path = "std::println", reason = "stdout belongs to cli::out — a stray write corrupts the captured bearer" },
+    { path = "std::print", reason = "stdout belongs to cli::out — a stray write corrupts the captured bearer" },
+    { path = "std::eprintln", reason = "stderr belongs to logger — eprintln! panics on a closed pipe and would kill a worker mid-request" },
+    { path = "std::eprint", reason = "stderr belongs to logger — eprint! panics on a closed pipe and would kill a worker mid-request" },
+]
+
+disallowed-types = [
+    # Belt and braces: chrono is built without the `clock` feature, so this type
+    # does not exist at all (E0433). Kept so that re-adding `clock` fails loudly.
+    # `allow-invalid` because this type is currently UNREACHABLE — chrono is built
+    # without `clock`, so referencing it is E0433. That unreachability *is* the
+    # invariant; the ban is here so that the day someone re-adds `clock`, the
+    # host timezone becomes a lint error instead of a silent correctness bug.
+    { path = "chrono::Local", allow-invalid = true, reason = "the host timezone must never be consulted; resolve through domain::datetime with TODO_MCP_TZ" },
+]
+
+disallowed-methods = [
+    # Wall-clock reads must go through the injected Clock so tests can pin time.
+    # The sanctioned #[allow] sites (see AGENTS.md): clock.rs SystemClock::now,
+    # logger.rs::now_iso and cli/commands.rs::chrono_now for chrono::Utc::now, and
+    # auth/store.rs::nanos for std::time::SystemTime::now. Do not add another.
+    { path = "chrono::Utc::now", reason = "use the injected Clock so tests can pin time; the only exceptions are clock.rs SystemClock::now, logger.rs::now_iso and cli/commands.rs::chrono_now" },
+    { path = "std::time::SystemTime::now", reason = "use the injected Clock so tests can pin time; the only exception is auth/store.rs::nanos (tmp-file name uniqueness)" },
+]

@@ -1,0 +1,27 @@
+target
+.git
+compose.yaml
+.env
+.env.*
+.envrc
+bin
+*.md
+docs
+# ...except the one doc a unit test reads (src/auth/aadsts.rs include_str!s it).
+!docs/app-registration.md
+.github
+.vscode
+.idea
+.claude
+# Credentials: never send them to the daemon, even though no COPY names them.
+**/.bearer
+**/*.bearer
+**/.mcp.json
+**/token.json
+**/token.json.tmp.*
+**/bearer.token
+**/.token.lock
+.todo-mcp
+data
+# docs/footprint.md's ELF check exports binaries here.
+release-out

@@ -1,0 +1,8 @@
+[toolchain]
+# Keep in sync with the rust:<version>-slim pin in compose.yaml (dev service) and
+# the cargo-zigbuild stage in Dockerfile. Dependabot cannot see dockerfile_inline.
+#
+# 1.89 is the hard floor: std File::lock/try_lock/unlock stabilised there, which is
+# what makes the fs4 crate unnecessary. Edition 2024 alone would only need 1.85.
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]

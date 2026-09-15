@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/hromadkom/microsoft-todo-mcp/security/advisories/new
+    about: Report privately. Never open a public issue for a security problem, and never paste token.json, bearer.token or an Authorization header.
+  - name: Setting up the Entra app registration
+    url: https://github.com/hromadkom/microsoft-todo-mcp/blob/main/docs/app-registration.md
+    about: Registering the app, admin consent for work or school accounts, and the AADSTS troubleshooting table.
+  - name: Question or usage help
+    url: https://github.com/hromadkom/microsoft-todo-mcp/discussions
+    about: Setup problems, client configuration, and general questions.

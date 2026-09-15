@@ -1,0 +1,124 @@
+# Runs the published image. Multi-arch registry images are built and pushed by
+# .github/workflows/release.yml. `docker compose build todo-mcp` instead builds
+# this checkout (through the Dockerfile's size gate) under the same tag, until a
+# later `docker compose pull todo-mcp` replaces it with the published one.
+#
+# First run, in this order, after `cp .env.example .env` and setting
+# TODO_MCP_CLIENT_ID (see docs/app-registration.md):
+#
+#   docker compose pull todo-mcp
+#   docker compose run --rm todo-mcp login    # one-time device-code sign-in; no TTY needed
+#   docker compose run --rm todo-mcp doctor   # prints list names and can print a task title: redact before sharing
+#   docker compose up -d todo-mcp
+#   BEARER="$(docker compose run --rm -T todo-mcp token)"   # the MCP bearer, kept in a shell variable
+#
+# then have your MCP client send `Authorization: Bearer $BEARER` (README.md, Quick
+# start). Do not redirect the bearer into a file in this checkout: it is a live
+# credential.
+#
+# -T on `compose run` is REQUIRED wherever output is captured. With a TTY, the
+# container's stderr is merged into the captured stdout, so any log line (such as
+# the JSON line `token` logs when it first generates the bearer) would end up in
+# the Authorization header. The TTY's \n -> \r\n rewrite is not the problem:
+# `token` prints no trailing newline, and the server trims whitespace anyway.
+#
+# `serve` refuses to start without a sign-in (exit 3, AUTH_REQUIRED) or with an
+# invalid configuration (exit 2), and `restart: unless-stopped` turns any refusal
+# into a loop that `docker compose ps` shows as `Restarting (N)`, N being the exit
+# code. `docker compose logs --tail 20 todo-mcp` names the fix. After `login`, run
+# `docker compose restart todo-mcp`. The tool list is fixed at startup, so a grant
+# widened later needs that restart too.
+#
+# `docker compose down -v` DELETES the todo-mcp-state volume: your Microsoft
+# sign-in (token.json) and the MCP bearer (bearer.token), plus the dev service's
+# cargo caches. Use `docker compose down`.
+name: microsoft-todo-mcp
+
+services:
+  todo-mcp:
+    build:
+      context: .
+      target: release
+    # Published by release.yml; `build:` above lets `docker compose build
+    # todo-mcp` produce the same tag from this checkout instead.
+    image: docker.io/hromadkom/microsoft-todo-mcp:latest
+    env_file:
+      # TODO_MCP_CLIENT_ID (required) + optional TODO_MCP_TZ / TODO_MCP_SCOPE /
+      # TODO_MCP_CACHE_TTL_SECONDS. Optional so a fresh clone can run the dev
+      # service before writing a .env — Compose validates env_file for every
+      # service in the file, not just the one being run.
+      - path: .env
+        required: false
+    environment:
+      # Binds all interfaces INSIDE the container; the ports mapping below is
+      # what actually decides reachability. Binding 127.0.0.1 in-container would
+      # make the port unreachable while still looking healthy to its own probe.
+      TODO_MCP_BIND: 0.0.0.0:8591
+      TODO_MCP_DATA_DIR: /data
+    ports:
+      # The explicit host-IP prefix is the actual protection. Publishing bare
+      # "8591:8591" on Linux writes a DOCKER-chain iptables rule that bypasses
+      # UFW entirely.
+      - "127.0.0.1:8591:8591"
+    volumes:
+      # Holds token.json (the Microsoft sign-in) and bearer.token (the MCP bearer).
+      # Ownership is inherited from the image on FIRST mount of an EMPTY volume.
+      # Reset it (deletes both, as `down -v` would) once no container uses it:
+      #   docker compose rm -sf todo-mcp
+      #   docker volume rm microsoft-todo-mcp_todo-mcp-state
+      - todo-mcp-state:/data
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    user: "65534:65534"
+    pids_limit: 64
+    mem_limit: 96m
+    # Equal to mem_limit on purpose: this disables swap. Without it the container
+    # can swap the in-memory access token to disk.
+    memswap_limit: 96m
+    cpus: 1.0
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    healthcheck:
+      test: ["CMD", "/todo-mcp", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # Dockerized Rust toolchain — the canonical way to run cargo in this repo, so
+  # no host Rust toolchain is assumed:
+  #
+  #   docker compose run --rm dev cargo test --locked
+  #   docker compose run --rm -e TZ=Pacific/Kiritimati dev cargo test --locked
+  #   docker compose run --rm dev cargo clippy --all-targets --locked -- -D warnings
+  #   docker compose run --rm dev sh scripts/gates.sh
+  #
+  # Named volumes keep the registry and build cache warm; /app/target never
+  # exists on the host.
+  dev:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM rust:1.97.1-slim
+        RUN rustup component add clippy rustfmt
+    working_dir: /app
+    volumes:
+      - .:/app
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/app/target
+    env_file:
+      - path: .env
+        required: false
+
+volumes:
+  todo-mcp-state:
+  cargo-registry:
+  cargo-target:

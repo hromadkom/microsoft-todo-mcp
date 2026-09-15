@@ -1,0 +1,233 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Pull requests: a newer push supersedes the running check, so cancel it.
+# Everything else (pushes to main, manual runs) gets a group of its own and is
+# never cancelled: main is the only cache producer, and a shared group would
+# still cancel a *pending* main run as soon as a newer one queued.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate:
+    # REQUIRED CHECK: the main ruleset matches this name exactly. Renaming it
+    # leaves main unmergeable against a check that never reports.
+    name: Hermetic gate
+    runs-on: ubuntu-latest
+    # Generous until a cold-cache run has been timed; tighten afterwards. A
+    # timeout on a required check blocks merges exactly like a failure.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/hermetic-gate
+        with:
+          # main is the sole cache producer: PR-scoped caches are evicted on
+          # merge and would otherwise thrash the shared 10 GB GHA cache budget.
+          write-cache: ${{ github.ref == 'refs/heads/main' }}
+
+  release:
+    # REQUIRED CHECK: see above. Deliberately not named after its platforms,
+    # so adding one does not rename the check.
+    name: Release image
+    runs-on: ubuntu-latest
+    # A cold cache compiles two LTO musl binaries at once on one runner; see
+    # the gate's note on tightening.
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      IMAGE: microsoft-todo-mcp:ci-smoke
+      # Obviously fake. Nothing in this job talks to Entra.
+      FAKE_CLIENT_ID: 00000000-0000-0000-0000-000000000000
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      # `release` takes its binary from the `size` stage, so this build IS the
+      # size gate; SIZE_LIMIT is the Dockerfile ARG default and nothing here
+      # overrides it. The gate only ever builds debug on glibc, so this is also
+      # the first CI exercise of panic="unwind" + LTO + opt-level="z" on musl,
+      # and of USER, VOLUME, HEALTHCHECK and COPY --chmod.
+      - name: Build release image + size gate (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: release
+          push: false
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=release
+          # main is the sole cache producer, as for the gate's scope=test.
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=release' || '' }}
+
+      # Same builder instance, so every layer is a local cache hit: this step
+      # only exports the amd64 image into the runner's Docker for the smoke.
+      - name: Load the linux/amd64 release image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: release
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}
+          platforms: linux/amd64
+          cache-from: type=gha,scope=release
+
+      # ---- Linux container smoke (m7 §7, §8). The first CI execution of
+      # ---- musl-linked code happens here. No secrets, no Entra.
+
+      - name: "Smoke: --version matches Cargo.toml"
+        run: |
+          version="$(awk -F'"' '/^\[package\]/ {p=1; next} /^\[/ {p=0} p && /^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
+          [ -n "$version" ] || { echo "::error::could not read [package] version from Cargo.toml"; exit 1; }
+          got="$(docker run --rm "$IMAGE" --version)"
+          echo "$got"
+          [ "$got" = "todo-mcp $version" ] || { echo "::error::--version printed '$got', expected 'todo-mcp $version'"; exit 1; }
+
+      - name: "Smoke: image config"
+        run: |
+          cfg="$(docker image inspect "$IMAGE" --format '{{json .Config}}')"
+          jq . <<<"$cfg"
+          fail=0
+          expect() {
+            jq -e "$1" <<<"$cfg" >/dev/null || { echo "::error::image config: expected $1"; fail=1; }
+          }
+          expect '.User == "65534:65534"'
+          expect '.Volumes == {"/data": {}}'
+          expect '.Entrypoint == ["/todo-mcp"]'
+          expect '.Cmd == ["serve"]'
+          expect '.ExposedPorts == {"8591/tcp": {}}'
+          expect '.Healthcheck.Test == ["CMD", "/todo-mcp", "healthcheck"]'
+          expect '.Healthcheck.Interval == 30000000000 and .Healthcheck.Timeout == 5000000000 and .Healthcheck.StartPeriod == 5000000000 and .Healthcheck.Retries == 3'
+          expect 'any(.Env[]; . == "TODO_MCP_DATA_DIR=/data")'
+          expect 'all(.Env[]; startswith("TODO_MCP_CLIENT_ID") | not)'
+          exit "$fail"
+
+      - name: "Smoke: the image has no shell"
+        run: |
+          set +e
+          out="$(docker run --rm --entrypoint sh "$IMAGE" -c true 2>&1)"
+          rc=$?
+          set -e
+          echo "exit $rc: $out"
+          [ "$rc" -ne 0 ] || { echo "::error::--entrypoint sh -c true succeeded; the image has a shell"; exit 1; }
+          grep -q 'executable file not found' <<<"$out" || { echo "::error::sh failed for an unexpected reason"; exit 1; }
+
+      - name: "Smoke: first mount of a fresh named volume (token, /data ownership)"
+        run: |
+          vol="todo-mcp-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "VOL=$vol" >> "$GITHUB_ENV"
+          if docker volume inspect "$vol" >/dev/null 2>&1; then
+            echo "::error::$vol already exists; this step needs its FIRST mount"; exit 1
+          fi
+          # Our image must be the first mount: an image without /data would
+          # create the volume root:root 0755 and mask the result (m7 §8).
+          # The subshell prints `x` after `token` so the substitution cannot
+          # strip a trailing newline, then exits with token's own status.
+          set +e
+          tok="$(docker run --rm -v "$vol:/data" "$IMAGE" token; rc=$?; printf x; exit "$rc")"
+          token_rc=$?
+          set -e
+          tok="${tok%x}"
+          # Print the ownership BEFORE asserting anything: a failed copy-up makes
+          # `token` refuse, and these two lines are what explain it.
+          root="$(docker volume inspect -f '{{ .Mountpoint }}' "$vol")"
+          root_stat="$(sudo stat -c '%u:%g %a' "$root" 2>&1)" || true
+          bearer_stat="$(sudo stat -c '%u:%g %a' "$root/bearer.token" 2>&1)" || true
+          echo "volume root:  $root_stat"
+          echo "bearer.token: $bearer_stat"
+          echo "token: exit $token_rc, ${#tok} bytes"
+          [ "$root_stat" = "65534:65534 700" ] || { echo "::error::fresh volume root is '$root_stat', expected '65534:65534 700'"; exit 1; }
+          [ "$bearer_stat" = "65534:65534 600" ] || { echo "::error::bearer.token is '$bearer_stat', expected '65534:65534 600'"; exit 1; }
+          [ "$token_rc" -eq 0 ] || { echo "::error::token exited $token_rc, expected 0"; exit 1; }
+          [ "${#tok}" -eq 64 ] || { echo "::error::token printed ${#tok} bytes, expected exactly 64"; exit 1; }
+          [[ "$tok" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::token is not 64 lowercase hex characters"; exit 1; }
+
+      - name: "Smoke: serve without a token is a clean refusal (exit 3)"
+        run: |
+          set +e
+          out="$(docker run --rm -v "$VOL:/data" -e TODO_MCP_CLIENT_ID="$FAKE_CLIENT_ID" "$IMAGE" serve 2>&1)"
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          [ "$rc" -eq 3 ] || { echo "::error::serve without token.json exited $rc, expected 3 (NOT_LOGGED_IN); 128+ means it died on a signal"; exit 1; }
+          grep -q '"code":"AUTH_REQUIRED"' <<<"$out" || { echo "::error::no AUTH_REQUIRED log line"; exit 1; }
+
+      # m7's exit gate on the real image, as PID 1 with no init: `docker exec …
+      # sh` fails, and SIGTERM exits 0 within 2 s. A FIFO token.json parks
+      # `serve` inside the boot refresh with no network: opening it for reading
+      # blocks until a writer appears, and nothing ever writes. Handlers that
+      # were installed only after boot would leave PID 1 discarding the SIGTERM
+      # until Docker SIGKILLs it (137) after 10 s.
+      - name: "Smoke: docker stop during boot exits 0 within 2 s (PID 1, no init)"
+        run: |
+          root="$(docker volume inspect -f '{{ .Mountpoint }}' "$VOL")"
+          sudo mkfifo -m 600 "$root/token.json"
+          sudo chown 65534:65534 "$root/token.json"
+          ctr="todo-mcp-stop-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "CTR=$ctr" >> "$GITHUB_ENV"
+          docker run -d --name "$ctr" -v "$VOL:/data" -e TODO_MCP_CLIENT_ID="$FAKE_CLIENT_ID" "$IMAGE" serve >/dev/null
+          # serve logs the TZ-unset warning after config and before the /data
+          # probe, the bearer and the boot refresh. Here-strings, not
+          # `docker logs | grep -q`: grep -q exiting early SIGPIPEs docker logs,
+          # and under pipefail the pipeline then fails with 141.
+          seen=0
+          for _ in $(seq 50); do
+            if grep -q 'TODO_MCP_TZ is unset' <<<"$(docker logs "$ctr" 2>&1)"; then seen=1; break; fi
+            sleep 0.2
+          done
+          # The probe and the bearer read take milliseconds; give serve time to
+          # reach the FIFO before checking that it is still running.
+          sleep 1
+          running="$(docker inspect -f '{{.State.Running}}' "$ctr")"
+          if [ "$seen" -ne 1 ] || [ "$running" != true ]; then
+            docker logs "$ctr" 2>&1 || true
+            echo "::error::serve did not park on the FIFO token.json (TZ warning seen: $seen, running: $running)"; exit 1
+          fi
+          set +e
+          exec_out="$(docker exec -u 0 "$ctr" sh -c true 2>&1)"
+          exec_rc=$?
+          set -e
+          echo "docker exec -u 0 sh: exit $exec_rc: $exec_out"
+          [ "$exec_rc" -ne 0 ] || { echo "::error::docker exec -u 0 sh succeeded; the image has a shell"; exit 1; }
+          grep -q 'executable file not found' <<<"$exec_out" || { echo "::error::docker exec sh failed for an unexpected reason"; exit 1; }
+          start=$(date +%s%N)
+          docker stop -t 10 "$ctr" >/dev/null
+          ms=$(( ($(date +%s%N) - start) / 1000000 ))
+          code="$(docker inspect -f '{{.State.ExitCode}}' "$ctr")"
+          docker logs "$ctr" 2>&1 || true
+          echo "docker stop: exit $code after ${ms} ms"
+          [ "$code" = 0 ] && [ "$ms" -lt 2000 ] || { echo "::error::docker stop gave exit $code after ${ms} ms, expected 0 within 2 s"; exit 1; }
+
+      - name: "Smoke: healthcheck with nothing listening exits 1"
+        run: |
+          # Empty stderr is what shows the 1 came from the probe: a refused
+          # configuration also exits 1, but logs an error line first.
+          set +e
+          err="$(docker run --rm "$IMAGE" healthcheck 2>&1 >/dev/null)"
+          rc=$?
+          set -e
+          echo "exit $rc, stderr: ${err:-<empty>}"
+          [ "$rc" -eq 1 ] || { echo "::error::healthcheck exited $rc, expected 1 (unhealthy; Docker reserves 2)"; exit 1; }
+          [ -z "$err" ] || { echo "::error::healthcheck wrote to stderr, so the probe may never have run: $err"; exit 1; }
+
+      - name: "Smoke: compose.yaml is valid"
+        run: docker compose config -q
+
+      # Container first: the stopped FIFO container still references the
+      # volume, so removing the volume first would fail this always() step.
+      - name: Remove the smoke container and volume
+        if: always()
+        run: |
+          if [ -n "${CTR:-}" ]; then docker rm -f "$CTR" || true; fi
+          if [ -n "${VOL:-}" ]; then docker volume rm -f "$VOL"; fi

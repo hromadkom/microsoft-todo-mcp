@@ -1,0 +1,50 @@
+name: Hermetic gate
+description: >-
+  Runs the hermetic gate — fmt, clippy, the full test suite and the structural
+  grep gates inside the Dockerfile `test` stage — then proves the suite is
+  independent of the host timezone. The single definition of "does this tree
+  pass?", shared by ci.yml and release.yml so the two can never disagree.
+
+# Composite rather than a reusable workflow on purpose: the shared unit is a
+# sequence of steps, not a whole job. A `workflow_call` job would report as
+# "<caller job> / <called job>", renaming the required status checks.
+
+inputs:
+  write-cache:
+    description: Export the BuildKit layer cache ("true"/"false"). Only ci.yml on main passes true.
+    required: false
+    default: "false"
+  image-tag:
+    description: Tag for the loaded gate image, reused by the timezone re-run.
+    required: false
+    default: microsoft-todo-mcp:ci-test
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Buildx
+      uses: docker/setup-buildx-action@v4
+
+    # The `test` stage chains fmt, clippy --locked -D warnings, cargo test
+    # --locked and scripts/gates.sh with `&&`, so any failure fails this step.
+    # `--locked` also proves Cargo.lock is in sync with Cargo.toml.
+    - name: Run the hermetic gate (fmt + clippy + tests + grep gates)
+      uses: docker/build-push-action@v7
+      with:
+        context: .
+        target: test
+        push: false
+        load: true
+        tags: ${{ inputs.image-tag }}
+        platforms: linux/amd64
+        cache-from: type=gha,scope=test
+        cache-to: ${{ inputs.write-cache == 'true' && 'type=gha,mode=max,scope=test' || '' }}
+
+    # The suite must pass under any host timezone. chrono is built without
+    # `clock` so chrono::Local does not exist — this proves it empirically, and
+    # would catch someone re-adding the feature.
+    - name: Prove host-TZ independence
+      shell: bash
+      run: |
+        docker run --rm -e TZ=Pacific/Kiritimati "${{ inputs.image-tag }}" \
+          cargo test --locked --offline

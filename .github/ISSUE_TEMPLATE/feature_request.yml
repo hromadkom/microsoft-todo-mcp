@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest a capability or an improvement.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This server is deliberately narrow. It exposes only Microsoft To Do, on one delegated
+        Graph scope (`Tasks.ReadWrite` or `Tasks.Read`, plus `offline_access`), and talks only to
+        Microsoft Entra sign-in and Microsoft Graph. Proposals that keep it that way have a much
+        better chance. Anything that needs another Graph scope (mail, calendar, files, your
+        profile), another network destination, task content on disk, or telemetry is out of scope
+        by design.
+
+        Never paste `token.json`, `bearer.token`, `token` output or an `Authorization` header. See
+        [SECURITY.md](https://github.com/hromadkom/microsoft-todo-mcp/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the situation, not the solution. What are you doing today, and where does it fall short?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should happen instead? If it affects tool input or output, sketch the JSON.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Can this be done today with the existing tools, or in your MCP client?
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This needs no Graph permission beyond Tasks.ReadWrite / Tasks.Read and no network destination beyond Microsoft Entra and Microsoft Graph.
+          required: true

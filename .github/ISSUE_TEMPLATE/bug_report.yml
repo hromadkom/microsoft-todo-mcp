@@ -1,0 +1,135 @@
+name: Bug report
+description: Something behaves incorrectly — a wrong task, date or tool result, a sign-in failure, a crash, or a protocol error.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before you post, never paste any of these:**
+
+        - `token.json` (it holds your Microsoft refresh token) or `bearer.token`;
+        - the output of `todo-mcp token`, or any `Authorization` header;
+        - a device code from `login`;
+        - unredacted `doctor` output or log lines. `doctor` prints your list names and can print a task title.
+
+        Replace list names, task titles, email addresses and IDs with placeholders.
+        Security problems go to a
+        [private advisory](https://github.com/hromadkom/microsoft-todo-mcp/security/advisories/new),
+        never a public issue. See
+        [SECURITY.md](https://github.com/hromadkom/microsoft-todo-mcp/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what did you get instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Failing command or tool call
+      description: |
+        The exact command (for example `docker compose run --rm todo-mcp login`), or the MCP
+        tool name and its arguments. Replace task titles and list names with placeholders.
+      render: text
+      placeholder: |
+        docker compose run --rm todo-mcp doctor
+
+        or
+
+        todo_complete_tasks { "task_ids": ["<task id>"], "list": "<list name>" }
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`docker compose run --rm todo-mcp --version`, or the image tag. `GET /healthz` and the `initialize` response's `serverInfo` report it too."
+      placeholder: "todo-mcp 0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - docker compose (the shipped compose.yaml)
+        - docker run (the published image, without compose)
+        - Host binary (cargo build / cargo run)
+        - Other (describe under What happened)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: account
+    attributes:
+      label: Account type
+      options:
+        - Personal Microsoft account (outlook.com, hotmail.com, live.com)
+        - Work or school account (Microsoft Entra ID tenant)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: TODO_MCP_SCOPE
+      description: If `login` or `doctor` reported a different grant or a scope warning, include that line (redacted) under Log output.
+      options:
+        - Tasks.ReadWrite (default)
+        - Tasks.Read
+    validations:
+      required: true
+
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      placeholder: "Claude Code / Claude Desktop / MCP Inspector / custom"
+
+  - type: textarea
+    id: aadsts
+    attributes:
+      label: AADSTS code, Trace ID and Correlation ID
+      description: |
+        For sign-in and token-refresh failures: the `AADSTS…` number plus the Trace ID,
+        Correlation ID and timestamp from Microsoft's message. They identify the failed request
+        and are not credentials, but remove any email address the message contains.
+      render: text
+      placeholder: |
+        AADSTS7000218
+        Trace ID: 00000000-0000-0000-0000-000000000000
+        Correlation ID: 00000000-0000-0000-0000-000000000000
+        Timestamp: 2026-01-01 00:00:00Z
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: Non-default `TODO_MCP_*` values, for example `TODO_MCP_TZ`. Leave out `TODO_MCP_CLIENT_ID`.
+      render: text
+      placeholder: "TODO_MCP_TZ=Europe/Prague"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output (stderr, redacted)
+      description: |
+        The stderr JSON lines around the failure, e.g. from `docker compose logs --tail 50 todo-mcp`.
+        Log lines are designed to carry no task content and no tokens (a list appears only as an
+        opaque hash), but a message relayed from Microsoft can include your email address, so check
+        before posting. `doctor` prints your list names and can print a task title: replace them with
+        placeholders before pasting. Never paste token.json or the output of `token`.
+      render: text
+
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Redaction
+      options:
+        - label: I removed tokens, `Authorization` headers, device codes, email addresses, list names and task titles from everything above.
+          required: true

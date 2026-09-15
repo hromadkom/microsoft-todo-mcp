@@ -1,0 +1,89 @@
+[package]
+name = "microsoft-todo-mcp"
+version = "0.1.0"
+description = "MCP server exposing only Microsoft To Do, over Streamable HTTP, on a single delegated Graph scope"
+authors = ["Martin Hromádko <hromadko.m@gmail.com>"]
+edition = "2024"
+# std File::lock/try_lock/unlock stabilised in 1.89.0 — that is what makes fs4
+# unnecessary. edition 2024 alone would only need 1.85.
+rust-version = "1.89"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/hromadkom/microsoft-todo-mcp"
+homepage = "https://github.com/hromadkom/microsoft-todo-mcp"
+keywords = ["mcp", "microsoft-todo", "microsoft-graph", "tasks", "todo"]
+categories = ["command-line-utilities", "api-bindings"]
+# Distributed as a container image, not a crate. Flip this to publish on crates.io;
+# the metadata above is already complete for that.
+publish = false
+
+[lib]
+name = "microsoft_todo_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "todo-mcp"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+# The ONLY outbound HTTP client. No `json` feature: it re-vendors serde_json paths we
+# already have. No `gzip` in v1.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+
+# The ONLY inbound HTTP server.
+tiny_http = "0.12"
+
+# features = ["std", "now"], NOT ["clock", "std"]. `clock` is what pulls
+# iana-time-zone and defines chrono::Local. Without it the host timezone is
+# STRUCTURALLY unreachable (E0433), not merely lint-banned.
+chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
+
+# Compiles the tzdb into the binary — this is what makes FROM scratch viable,
+# since there is no /usr/share/zoneinfo in the image.
+chrono-tz = "0.10"
+
+# Graph returns Windows TZID strings ("Central Europe Standard Time") in
+# dateTimeTimeZone.timeZone. `chrono-tz-0_10` gates From<WindowsTimezone> for Tz.
+windows-timezones = { version = "0.5", features = ["chrono-tz-0_10"] }
+
+signal-hook = { version = "0.4", default-features = false }
+
+# Constant-time bearer compare. Already in the tree via rustls, so marginal cost is 0.
+subtle = { version = "2.6", default-features = false }
+
+# CSPRNG for the auto-generated bearer token. Already compiled via ring, so a direct
+# dependency costs ~0 bytes and avoids a /dev/urandom code path that FROM scratch
+# may not provide.
+getrandom = "0.2"
+
+[features]
+# NOT in default. Gates UreqTransport::with_base (a Graph transport that allows
+# plain http) and EntraClient::with_base (another authority, plain http allowed),
+# so a release binary can neither be pointed at another Entra host nor speak
+# plaintext. Both also compile under cfg(test), but no test calls either today:
+# tests/common/mod.rs rewrites the Graph host in its own GraphTransport instead,
+# so `cargo test --locked` needs no --features flag.
+test-fixtures = []
+
+# No dev-dependencies, deliberately: `cargo test --locked` then resolves the exact
+# graph the release build uses. tests/common/mod.rs hand-rolls the fixture
+# Entra/Graph server on tiny_http, which is already a dependency.
+
+[profile.dev]
+# Full debuginfo makes linking the test binaries memory-hungry enough to OOM the
+# Docker VM; line tables keep useful panic locations at a fraction of the cost.
+debug = "line-tables-only"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+# DELIBERATE divergence from calendar-ics-mcp's `abort`: this is a long-lived
+# multi-client server where one bad index must not drop every connected session.
+# Only pays for itself together with the panic hook, catch_unwind around the whole
+# worker loop, and poison-tolerant locks.
+panic = "unwind"
+strip = true

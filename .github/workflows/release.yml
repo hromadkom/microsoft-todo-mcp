@@ -1,0 +1,190 @@
+name: Release
+
+# Publishing is driven entirely by GitHub Releases: create a release with tag
+# `vX.Y.Z` and this workflow verifies, builds, and pushes the images.
+#
+# Prerequisites in the repository settings:
+#   Secrets   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (an access token, not the password)
+#   Variables IMAGE_NAME (optional, default: hromadkom/microsoft-todo-mcp)
+#             REGISTRY   (optional, default: docker.io)
+on:
+  release:
+    types: [published]
+  # Manual re-run, e.g. after fixing registry credentials. Takes the tag to
+  # build; it must already exist and must match Cargo.toml. It must also
+  # contain `.github/actions/hermetic-gate`: a `uses: ./…` action is resolved
+  # from the checked-out tree, which here is the tag, so tags cut before that
+  # action was added cannot be re-run this way. `:latest` is opt-in on a
+  # re-run, so rebuilding an old tag never moves `:latest` back to it.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and push (e.g. v0.1.0)"
+        required: true
+        type: string
+      latest:
+        description: "Also push :latest (never for a pre-release version such as v0.2.0-rc.1)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  # Never publish an image that does not build clean and pass its tests, and
+  # never publish a tag whose version disagrees with the crate manifest.
+  verify:
+    name: Verify and test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      fullsha: ${{ steps.resolve.outputs.fullsha }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Resolve version and check it matches Cargo.toml
+        id: resolve
+        # Through env, never `${{ }}` pasted into the script: git allows `$`,
+        # `(`, `)` and `"` in ref names, and an expression is expanded before
+        # the regex below could reject it.
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$TAG"
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag '$tag' is not a vX.Y.Z semver tag"
+            exit 1
+          fi
+          version="${tag#v}"
+
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [[ "$manifest" != "$version" ]]; then
+            echo "::error::tag '$tag' does not match Cargo.toml version '$manifest'."
+            echo "::error::Bump Cargo.toml (and Cargo.lock), commit, then re-tag."
+            exit 1
+          fi
+
+          # The checked-out tag's commit, not github.sha: on workflow_dispatch
+          # github.sha is the tip of the branch the run was dispatched from
+          # (normally main), not the tag.
+          fullsha=$(git rev-parse HEAD)
+          sha=${fullsha:0:7}
+          # A SemVer pre-release version never becomes :latest, whatever the
+          # GitHub pre-release checkbox or the dispatch input says.
+          prerelease=$([[ "$version" == *-* ]] && echo true || echo false)
+
+          {
+            echo "version=$version"
+            echo "sha=$sha"
+            echo "fullsha=$fullsha"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $version from $fullsha (pre-release: $prerelease)"
+
+      - name: Warn if CHANGELOG has no entry
+        run: |
+          if ! grep -q "^## \[${{ steps.resolve.outputs.version }}\]" CHANGELOG.md; then
+            echo "::warning::CHANGELOG.md has no '## [${{ steps.resolve.outputs.version }}]' section."
+          fi
+
+      # The same gate ci.yml runs on every pull request, and what contributors
+      # run locally as `docker build --target test .` — one definition, in
+      # .github/actions/hermetic-gate.
+      #
+      # This path only consumes the cache. A run triggered by a release is on a
+      # tag ref, and a cache written from a tag is not readable from main or
+      # from pull requests, so exporting here would produce an entry nothing
+      # can ever restore. ci.yml on main is the sole producer.
+      - name: Run the hermetic gate
+        uses: ./.github/actions/hermetic-gate
+        with:
+          write-cache: "false"
+
+  publish:
+    name: Build and push image
+    needs: verify
+    runs-on: ubuntu-latest
+    # Add `environment: release` here (and create it in repo settings) if you
+    # ever want a manual approval step before images go out.
+    steps:
+      # The exact commit verify tested and labels the image with, not the tag
+      # resolved a second time: a tag moved between the jobs must not put
+      # untested code under the tested revision label.
+      - name: Check out the verified commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.fullsha }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # No QEMU: the builder stage is pinned to $BUILDPLATFORM and
+      # cargo-zigbuild cross-compiles both musl targets natively. Emulating
+      # the arm64 build here would be an order of magnitude slower.
+
+      - name: Log in to the registry
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ${{ vars.REGISTRY || 'docker.io' }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # `sha-<7>` and the revision label come from the verify job's checkout of
+      # the tag. metadata-action's own `type=sha` and default revision use
+      # github.sha, which on a dispatch run is the dispatching branch's tip
+      # (normally main) rather than the tag.
+      - name: Derive tags and OCI labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ vars.REGISTRY || 'docker.io' }}/${{ vars.IMAGE_NAME || 'hromadkom/microsoft-todo-mcp' }}
+          tags: |
+            type=raw,value=${{ needs.verify.outputs.version }}
+            type=raw,value=sha-${{ needs.verify.outputs.sha }}
+            type=raw,value=latest,enable=${{ needs.verify.outputs.prerelease != 'true' && ((github.event_name == 'release' && !github.event.release.prerelease) || inputs.latest == true) }}
+          labels: |
+            org.opencontainers.image.title=microsoft-todo-mcp
+            org.opencontainers.image.description=MCP server exposing only Microsoft To Do, over Streamable HTTP, on a single delegated Graph scope
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.verify.outputs.fullsha }}
+
+      - name: Build and push (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # Build provenance is worth recording. An SBOM is not: the runtime
+          # stage is FROM scratch with a single static binary and no package
+          # manager, so the scanner would attest to an empty package list.
+          provenance: mode=max
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Consume only, for the same reason as the gate above: a cache
+          # exported from this tag ref could never be restored. ci.yml on main
+          # is the sole producer of scope=release.
+          cache-from: type=gha,scope=release
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
