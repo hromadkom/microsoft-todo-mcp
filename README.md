@@ -16,7 +16,7 @@ nothing else.
 >
 > | | |
 > |---|---|
-> | **Test suite** | 195 tests (111 unit, 84 integration) against a hand-rolled fixture Entra/Graph server. Green under the host time zone and under `TZ=Pacific/Kiritimati`, and inside `docker build --target test .` |
+> | **Test suite** | 201 tests (114 unit, 87 integration) against a hand-rolled fixture Entra/Graph server. Green under the host time zone and under `TZ=Pacific/Kiritimati`, and inside `docker build --target test .` |
 > | **Release image** | Built for `linux/amd64` and `linux/arm64` through the size gate, and checked on macOS arm64 Docker Desktop: user `65534:65534`, `/data` volume, healthcheck, no shell. A compose run with a fake client ID showed a fresh named volume's `/data` owned `65534:65534` mode `0700` (Docker Desktop keeps named volumes on ext4 inside its Linux VM; only bind mounts go through VirtioFS), and the `Restarting (3)` refusal without a sign-in |
 > | **Linux** | CI's `Release image` job asserts that first-mount ownership again on the amd64 image on a native Linux engine, and is the only evidence for `docker stop` during boot exiting 0 within 2 s (as PID 1, no init). Stopping a running server, and its drain, are tested on the host by `tests/shutdown.rs` |
 > | **Never done** | A run against a real Microsoft account. The live-Graph assumptions — `$batch` on `/me/todo/*`, whether `null` clears a due date, which Windows zone names a date write accepts, the exact scopes Microsoft grants — are still assumptions. [CHANGELOG.md](CHANGELOG.md) lists them all |
@@ -156,7 +156,18 @@ that `docker compose ps` shows as `Restarting (N)`, N being the
 missing `TODO_MCP_CLIENT_ID`, 1 a sign-in or token that Microsoft or the server refused.
 `docker compose logs --tail 20 todo-mcp` names the fix. After `login`, run
 `docker compose restart todo-mcp`. The tool list is fixed at startup, so a grant
-widened later also needs that restart.
+widened later also needs that restart. For a sidecar that should wait on the
+listener before sign-in, set `TODO_MCP_START_WITHOUT_TOKEN=1`; it can use
+Compose's `condition: service_healthy` and tool calls answer `auth_required`
+until `login` lands.
+
+```yaml
+services:
+  sidecar:
+    depends_on:
+      todo-mcp:
+        condition: service_healthy
+```
 
 **`docker compose down -v` deletes your sign-in and MCP bearer** (the `todo-mcp-state`
 volume holds both); use `docker compose down`.
@@ -231,6 +242,7 @@ and every problem found is reported at once.
 | `TODO_MCP_CLIENT_SECRET` | — | must be unset | Any value is a startup refusal: this is a public client and never sends a secret. |
 | `TODO_MCP_TZ` | `UTC` (with a warning) | an IANA name, case-insensitive | "Overdue" and "due today" are undefined without it. Set it to the zone Outlook → Settings → Language and time shows. Any IANA name works for reading, but a **dated write** needs a zone Graph can map to a Windows time-zone name: `doctor` shows it as "Windows name for writes", and a write in a zone without one is refused with a nearby zone suggested. Tools also take a per-call `timezone` argument. |
 | `TODO_MCP_SCOPE` | `Tasks.ReadWrite` | `Tasks.ReadWrite` or `Tasks.Read` | A **ceiling**: with `Tasks.Read` the five write tools stay absent even if Microsoft grants `Tasks.ReadWrite`. The stored refresh token is read-only only if the app registration grants just `Tasks.Read`; otherwise `login`, `serve` and `doctor` warn that it can write your tasks. Changing it requires a new `login`. |
+| `TODO_MCP_START_WITHOUT_TOKEN` | `0` | `1`/`0` (also `true`/`false`/`yes`/`no`) | With `1`, `serve` binds without a sign-in, `/healthz` is 200, and tool calls answer `auth_required` until `login` lands; the next call picks up the token without a restart. The tool list is the `TODO_MCP_SCOPE` ceiling, and write calls are refused if the grant is narrower. Configuration, data-directory and bind failures still refuse. |
 | `TODO_MCP_TENANT` | `common` | a tenant GUID, a verified domain, `organizations` or `consumers` | For a single-tenant app registration (AADSTS50194). |
 | `TODO_MCP_BIND` | `0.0.0.0:8591` | `<ip>:<port>` | Listens on every interface, outside a container too. In the container the compose port mapping (`127.0.0.1:8591`) decides reachability; on a host run set `127.0.0.1:8591`. |
 | `TODO_MCP_DATA_DIR` | `/data` | an absolute path | Created `0700` if missing; a looser mode is a warning. Holds `token.json` (0600), `bearer.token` (0600 when generated), `.token.lock` (0600, the lock every read and write of `token.json` takes) and short-lived `token.json.tmp.*` files. |
@@ -273,7 +285,7 @@ output anywhere.**
 | `0` | Success. `doctor`: no findings. `healthcheck`: healthy. `serve`: stopped by SIGINT/SIGTERM, including during startup or by a second signal; requests still running when the 5 s drain ends (or at a second signal) are abandoned, and a drain-deadline abandonment is logged as a warning. |
 | `1` | A runtime error: Microsoft refused the sign-in, Graph or the network failed, `token.json` is unusable or its grant is refused (a `.All` permission, or no Tasks permission), the port could not be bound, or the signal handlers could not be installed. `doctor`: at least one finding, invalid configuration included. `healthcheck`: unhealthy for any reason, invalid configuration included — Docker reads `1` as unhealthy and reserves `2`. |
 | `2` | Usage error (an unknown command or flag) or invalid configuration, including a data directory or bearer file that cannot be used. |
-| `3` | Not signed in: `serve` found no `token.json` (logged as `AUTH_REQUIRED`). Run `login`. |
+| `3` | Not signed in: `serve` found no `token.json` (logged as `AUTH_REQUIRED`). Run `login`, unless `TODO_MCP_START_WITHOUT_TOKEN=1`. |
 | `130` / `143` | A one-shot command (`login`, `logout`, `token`, `doctor`, `healthcheck`) was interrupted by SIGINT / SIGTERM. `serve` never exits with these. |
 
 ### Signing out and rotating the MCP bearer

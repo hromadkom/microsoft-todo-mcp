@@ -181,28 +181,44 @@ pub fn serve() -> Result<i32, AppError> {
     }
     let bearer = load_or_create_bearer(&cfg.bearer_file)?;
 
-    // Refuse to start without a usable token: the tool list is frozen at boot,
-    // and logging in later would leave the write tools absent until restart.
+    // The tool list is frozen at boot. In the opt-in no-token mode it is built
+    // from the configured scope ceiling, and dispatch follows the first grant
+    // that refreshes successfully after login.
     let tokens = Arc::new(token_provider(&cfg));
-    if let Err(e) = tokens.access_token() {
-        if let AuthError::Entra(f) = &e {
-            logger::error(&f.render(), &[]);
+    let grant = match tokens.access_token() {
+        Ok(_) => {
+            let grant = tokens.initial_grant().unwrap_or(Grant::None);
+            if grant == Grant::None {
+                return Err(AppError::TokenStore(
+                    "the granted scope carries neither Tasks.Read nor Tasks.ReadWrite".into(),
+                ));
+            }
+            grant
         }
-        return Err(e.into());
-    }
-    let grant = tokens.initial_grant().unwrap_or(Grant::None);
-    if grant == Grant::None {
-        return Err(AppError::TokenStore(
-            "the granted scope carries neither Tasks.Read nor Tasks.ReadWrite".into(),
-        ));
-    }
+        Err(e) => {
+            if let AuthError::Entra(f) = &e {
+                logger::error(&f.render(), &[]);
+            }
+            if !cfg.start_without_token {
+                return Err(e.into());
+            }
+            let app: AppError = e.into();
+            logger::error(&app.message(), &[("code", json!(app.code()))]);
+            logger::warn(
+                "serving without a Microsoft sign-in (TODO_MCP_START_WITHOUT_TOKEN); tool calls answer auth_required until a login lands",
+                &[],
+            );
+            Grant::None
+        }
+    };
     // Once, at boot, and only scope names: extra granted scopes are warned about
     // the same way login and doctor do.
-    if let Some(w) = tokens
-        .status()
-        .live_scope
-        .as_deref()
-        .and_then(|s| audit_scope(s, &cfg.scope.requested()).warning())
+    if grant != Grant::None
+        && let Some(w) = tokens
+            .status()
+            .live_scope
+            .as_deref()
+            .and_then(|s| audit_scope(s, &cfg.scope.requested()).warning())
     {
         logger::warn(&w, &[]);
     }
@@ -217,7 +233,21 @@ pub fn serve() -> Result<i32, AppError> {
         cfg.max_attempts,
         prefer_tz,
     );
-    let state = ServerState::new(cfg.clone(), graph, Arc::new(SystemClock), grant);
+    let tools_grant = if grant == Grant::None {
+        match cfg.scope {
+            ScopeChoice::ReadWrite => Grant::ReadWrite,
+            ScopeChoice::Read => Grant::ReadOnly,
+        }
+    } else {
+        grant
+    };
+    let state = ServerState::with_tools_grant(
+        cfg.clone(),
+        graph,
+        Arc::new(SystemClock),
+        grant,
+        tools_grant,
+    );
     let mcp = Arc::new(McpServer {
         name: "microsoft-todo-mcp",
         version: env!("CARGO_PKG_VERSION"),
@@ -232,8 +262,13 @@ pub fn serve() -> Result<i32, AppError> {
             ("grant", json!(grant.as_str())),
             (
                 "tools",
-                json!(if grant == Grant::ReadWrite { 10 } else { 5 }),
+                json!(if tools_grant == Grant::ReadWrite {
+                    10
+                } else {
+                    5
+                }),
             ),
+            ("signed_in", json!(grant != Grant::None)),
             ("tz", json!(cfg.effective_tz().name())),
             ("tz_configured", json!(cfg.tz.is_some())),
             ("cache_ttl_seconds", json!(cfg.cache_ttl_seconds)),

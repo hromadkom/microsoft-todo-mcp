@@ -8,12 +8,80 @@ use std::time::Instant;
 use chrono::{Duration, TimeZone, Utc};
 use serde_json::{Value, json};
 
-use common::{Override, harness, harness_booted, pinned_now, seed_22_lists};
+use common::{
+    Override, harness, harness_booted, harness_unsigned, pinned_now, seed_22_lists,
+    write_token_file,
+};
+use microsoft_todo_mcp::auth::Grant;
 use microsoft_todo_mcp::cache::log_ref;
 use microsoft_todo_mcp::mcp::ToolProvider;
 
 const RW_SCOPE: &str = "https://graph.microsoft.com/Tasks.ReadWrite offline_access";
 const READ_SCOPE: &str = "https://graph.microsoft.com/Tasks.Read offline_access";
+
+#[test]
+fn an_unsigned_server_recovers_on_the_first_call_after_login() {
+    let h = harness_unsigned(&[], RW_SCOPE);
+    assert!(!h.dir.join("token.json").exists());
+
+    let lists = h.call("todo_lists", json!({}));
+    assert_eq!(lists["isError"], true, "{lists}");
+    assert!(
+        lists["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("auth_required"),
+        "{lists}"
+    );
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(status["structuredContent"]["grant"], "none", "{status}");
+    assert_eq!(
+        status["structuredContent"]["write_tools_enabled"], false,
+        "{status}"
+    );
+    assert_eq!(
+        status["structuredContent"]["token"]["present"], false,
+        "{status}"
+    );
+    let write = h.call("todo_create_tasks", json!({"tasks": [{"title": "x"}]}));
+    assert_eq!(write["isError"], true, "{write}");
+    assert!(
+        write["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("auth_required"),
+        "{write}"
+    );
+
+    write_token_file(&h.dir, "RT-OLD", RW_SCOPE);
+    let lists = h.call("todo_lists", json!({}));
+    assert!(lists.get("isError").is_none(), "{lists}");
+    assert_eq!(h.state.effective_grant(), Grant::ReadWrite);
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["grant"], "Tasks.ReadWrite",
+        "{status}"
+    );
+    assert_eq!(
+        status["structuredContent"]["write_tools_enabled"], true,
+        "{status}"
+    );
+}
+
+#[test]
+fn an_unsigned_server_refuses_writes_after_a_narrower_grant_lands() {
+    let h = harness_unsigned(&[], READ_SCOPE);
+    write_token_file(&h.dir, "RT-OLD", RW_SCOPE);
+    let lists = h.call("todo_lists", json!({}));
+    assert!(lists.get("isError").is_none(), "{lists}");
+    let write = h.call("todo_create_tasks", json!({"tasks": [{"title": "x"}]}));
+    assert_eq!(write["isError"], true, "{write}");
+    let text = write["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("current Microsoft Graph grant is `Tasks.Read`"),
+        "{text}"
+    );
+}
 
 #[test]
 fn a_read_config_caps_a_readwrite_consent_in_tools_list_and_account_status() {

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in startup without a sign-in.** `TODO_MCP_START_WITHOUT_TOKEN=1` keeps
+  `serve` healthy for sidecar deployments until the first login, then picks up
+  the token on the next tool call without a restart.
+
 ## [0.1.0] - 2026-09-15
 
 First public release.

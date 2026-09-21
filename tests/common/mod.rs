@@ -803,11 +803,40 @@ pub fn harness_booted(extra: &[(&str, &str)], granted_scope: &str) -> Harness {
 }
 
 fn build_harness(extra: &[(&str, &str)], endpoint_scope: &str, grant: Option<Grant>) -> Harness {
+    build_harness_inner(
+        extra,
+        endpoint_scope,
+        grant,
+        true,
+        grant.unwrap_or(Grant::None),
+    )
+}
+
+/// Build the opt-in startup state before a token has landed on disk.
+pub fn harness_unsigned(extra: &[(&str, &str)], endpoint_scope: &str) -> Harness {
+    build_harness_inner(
+        extra,
+        endpoint_scope,
+        Some(Grant::None),
+        false,
+        Grant::ReadWrite,
+    )
+}
+
+fn build_harness_inner(
+    extra: &[(&str, &str)],
+    endpoint_scope: &str,
+    grant: Option<Grant>,
+    write_token: bool,
+    tools_grant: Grant,
+) -> Harness {
     let fx = Fixture::start();
     let dir = temp_dir("harness");
     let cfg = config(&dir, extra);
     let requested = cfg.scope.requested();
-    write_token_file(&dir, "RT-OLD", &requested);
+    if write_token {
+        write_token_file(&dir, "RT-OLD", &requested);
+    }
     let clock = Arc::new(FixedClock::at(pinned_now()));
     let endpoint = Arc::new(StubEndpoint::new(endpoint_scope));
     struct Shared(Arc<StubEndpoint>);
@@ -853,7 +882,13 @@ fn build_harness(extra: &[(&str, &str)], endpoint_scope: &str, grant: Option<Gra
             blocked = cv.wait(blocked).unwrap();
         }
     });
-    let state = Arc::new(ServerState::new(cfg, graph, clock.clone(), grant));
+    let state = Arc::new(ServerState::with_tools_grant(
+        cfg,
+        graph,
+        clock.clone(),
+        grant,
+        tools_grant,
+    ));
     Harness {
         fx,
         state,

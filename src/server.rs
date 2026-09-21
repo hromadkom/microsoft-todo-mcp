@@ -36,7 +36,8 @@ pub struct ServerState {
     pub cache: RwLock<Cache>,
     /// Single-flight for cold syncs. Held across HTTP by design.
     pub refill: Mutex<()>,
-    /// Frozen at construction from the granted scope.
+    /// Frozen at construction from the granted scope, or configured ceiling
+    /// when serving without a sign-in.
     pub tools: Value,
     pub grant: Grant,
     pub started: Instant,
@@ -129,8 +130,18 @@ type Known = HashMap<String, (Vec<Task>, bool)>;
 
 impl ServerState {
     pub fn new(cfg: Config, graph: GraphClient, clock: Arc<dyn Clock>, grant: Grant) -> Self {
+        Self::with_tools_grant(cfg, graph, clock, grant, grant)
+    }
+
+    pub fn with_tools_grant(
+        cfg: Config,
+        graph: GraphClient,
+        clock: Arc<dyn Clock>,
+        grant: Grant,
+        tools_grant: Grant,
+    ) -> Self {
         let tz = cfg.effective_tz();
-        let tools = tools::build_tools(grant, tz.name());
+        let tools = tools::build_tools(tools_grant, tz.name());
         let cache = Cache::new(cfg.cache_ttl_seconds, cfg.cache_max_tasks);
         Self {
             cfg,
@@ -144,6 +155,16 @@ impl ServerState {
             tz,
             warned_tzids: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// The grant tool dispatch acts on: the boot grant, or — when `serve`
+    /// started without a sign-in — the grant of the first refresh that has
+    /// succeeded since.
+    pub fn effective_grant(&self) -> Grant {
+        if self.grant != Grant::None {
+            return self.grant;
+        }
+        self.graph.tokens().initial_grant().unwrap_or(Grant::None)
     }
 
     /// The cache lock RESETS on poison instead of absorbing it (m4 §1.2).

@@ -36,7 +36,8 @@ pub const WRITE_TOOLS: [&str; 5] = [
 ];
 
 /// `tools/list` for a grant: 10 under `ReadWrite`, 5 otherwise. Computed once
-/// at construction and frozen (m6 §7).
+/// at construction and frozen (m6 §7); startup without a token passes the
+/// configured scope ceiling here.
 pub fn build_tools(grant: Grant, tz: &str) -> Value {
     let all = schema::all(tz);
     let keep: Vec<Value> = all
@@ -53,7 +54,11 @@ pub fn dispatch(state: &ServerState, name: &str, args: &Value) -> Result<Value, 
     if !args.is_object() {
         return Ok(render::error("arguments must be a JSON object".into()));
     }
-    if WRITE_TOOLS.contains(&name) && state.grant != Grant::ReadWrite {
+    let grant = state.effective_grant();
+    if WRITE_TOOLS.contains(&name)
+        && grant != Grant::ReadWrite
+        && (grant != Grant::None || state.cfg.scope == ScopeChoice::Read)
+    {
         // Under a Read config the grant is capped at Tasks.Read (auth::vet_grant),
         // so "re-run login and restart" would change nothing.
         let text = if state.cfg.scope == ScopeChoice::Read {
@@ -61,7 +66,7 @@ pub fn dispatch(state: &ServerState, name: &str, args: &Value) -> Result<Value, 
         } else {
             format!(
                 "Refused: the current Microsoft Graph grant is `{}`. Write tools require Tasks.ReadWrite. To enable them, {LOGIN_HINT}. {RESTART_HINT}.",
-                state.grant.as_str()
+                grant.as_str()
             )
         };
         return Ok(render::error(text));

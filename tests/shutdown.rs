@@ -18,7 +18,8 @@
 //! pass here.
 //!
 //! No token.json is ever written, so nothing here can reach the network even if
-//! a synchronisation assumption breaks: `serve` would exit 3 instead.
+//! a synchronisation assumption breaks: the default `serve` path exits 3, while
+//! the opt-in test below proves the listener stays up without one.
 //!
 //! Never call `Shutdown::install()` in a normal test: outside the re-executed
 //! child it would make Ctrl-C `_exit(0)` the test runner.
@@ -174,6 +175,22 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
+fn rpc(base: &str, bearer: &str, body: &str) -> Value {
+    let auth = format!("Bearer {bearer}");
+    let mut response = agent()
+        .post(format!("{base}/mcp"))
+        .header("Authorization", &auth)
+        .send(body)
+        .expect("MCP request");
+    serde_json::from_str(
+        &response
+            .body_mut()
+            .read_to_string()
+            .expect("MCP response body"),
+    )
+    .expect("MCP JSON response")
+}
+
 type CallResult = Result<(u16, String), ureq::Error>;
 
 fn call_in_background(base: &str) -> JoinHandle<CallResult> {
@@ -187,6 +204,83 @@ fn call_in_background(base: &str) -> JoinHandle<CallResult> {
         let status = res.status().as_u16();
         Ok((status, res.body_mut().read_to_string()?))
     })
+}
+
+#[test]
+fn serve_without_a_token_stays_up_and_serves_healthz_when_opted_in() {
+    for (scope, expected_tools) in [("Tasks.ReadWrite", 10), ("Tasks.Read", 5)] {
+        let dir = std::env::temp_dir().join(format!(
+            "todo-mcp-start-without-token-{}-{scope}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .expect("data dir");
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_todo-mcp"));
+        cmd.env_clear()
+            .arg("serve")
+            .env("TODO_MCP_CLIENT_ID", "00000000-0000-0000-0000-000000000000")
+            .env("TODO_MCP_DATA_DIR", &dir)
+            .env("TODO_MCP_BIND", "127.0.0.1:0")
+            .env("TODO_MCP_TZ", "UTC")
+            .env("TODO_MCP_SCOPE", scope)
+            .env("TODO_MCP_START_WITHOUT_TOKEN", "1");
+        let mut p = Proc::spawn(cmd);
+        let base = base_url(&mut p);
+        let bearer = std::fs::read_to_string(dir.join("bearer.token"))
+            .expect("bearer generated")
+            .trim()
+            .to_string();
+
+        let health = agent()
+            .get(format!("{base}/healthz"))
+            .call()
+            .expect("healthz");
+        assert_eq!(health.status().as_u16(), 200, "{scope}");
+
+        let listed = rpc(
+            &base,
+            &bearer,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        );
+        assert_eq!(
+            listed["result"]["tools"].as_array().map(Vec::len),
+            Some(expected_tools),
+            "{scope}: {listed}"
+        );
+        let called = rpc(
+            &base,
+            &bearer,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"todo_lists","arguments":{}}}"#,
+        );
+        assert_eq!(called["result"]["isError"], true, "{scope}: {called}");
+        assert!(
+            called["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("auth_required"),
+            "{scope}: {called}"
+        );
+        assert!(
+            called["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("login"),
+            "{scope}: {called}"
+        );
+        assert!(!dir.join("token.json").exists(), "{scope}");
+
+        p.signal("TERM");
+        let status = p.exit_within(Duration::from_secs(2));
+        assert_eq!(status.code(), Some(0), "{scope}: {status:?}");
+        let log = p.log();
+        assert!(has(&log, "microsoft-todo-mcp started"), "{scope}: {log:#?}");
+        assert!(!dir.join("token.json").exists(), "{scope}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]

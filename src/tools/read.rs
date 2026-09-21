@@ -927,10 +927,10 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
     let live = if ts.live_scope.is_some() {
         ts.live_grant
     } else {
-        state.grant
+        state.effective_grant()
     };
     let restart_reason = ts.restart_reason.clone();
-    let write_enabled = state.grant == Grant::ReadWrite;
+    let write_enabled = state.effective_grant() == Grant::ReadWrite;
     let widened = !write_enabled && live == Grant::ReadWrite;
     let stats = state.cache_read().stats(std::time::Instant::now());
     let gs = state.graph.stats();
