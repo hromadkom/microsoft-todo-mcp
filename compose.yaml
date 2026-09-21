@@ -27,8 +27,8 @@
 # into a loop that `docker compose ps` shows as `Restarting (N)`, N being the exit
 # code. `docker compose logs --tail 20 todo-mcp` names the fix. After `login`, run
 # `docker compose restart todo-mcp`. The tool list is fixed at startup, so a grant
-# widened later needs that restart too; set TODO_MCP_START_WITHOUT_TOKEN=1 to keep
-# the listener healthy for sidecars before the first sign-in.
+# widened later needs that restart too. Set TODO_MCP_START_WITHOUT_TOKEN=1 for
+# follow mode: the listener stays healthy for sidecars and later logins need no restart.
 #
 # `docker compose down -v` DELETES the todo-mcp-state volume: your Microsoft
 # sign-in (token.json) and the MCP bearer (bearer.token), plus the dev service's

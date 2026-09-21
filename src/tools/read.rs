@@ -913,6 +913,9 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
         Ok(v) => v.unwrap_or(false),
         Err(e) => return invalid_args("todo_account_status", &e),
     };
+    if state.boot_grant().is_none() {
+        let _ = state.graph.tokens().access_token_after_login();
+    }
     let connectivity = if check {
         let mut budget = state.budget();
         match state.graph.get_json(&lists_probe_url(), &mut budget) {
@@ -922,15 +925,17 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
     } else {
         json!({ "checked": false, "ok": Value::Null, "detail": Value::Null })
     };
-    // Read the token status AFTER the probe so a first refresh is reflected.
+    // Read the token status after the optional refresh so a later login is reflected.
     let ts = state.graph.tokens().status();
-    let eff = state.effective_grant();
+    let eff = state
+        .boot_grant()
+        .or_else(|| ts.live_scope.is_some().then_some(ts.live_grant));
     let live = if ts.live_scope.is_some() {
         ts.live_grant
     } else {
         eff.unwrap_or(Grant::None)
     };
-    let restart_reason = ts.restart_reason.clone();
+    let restart_reason = state.restart_reason_for(ts.live_scope.is_some().then_some(ts.live_grant));
     let write_enabled = eff == Some(Grant::ReadWrite);
     let widened = !write_enabled && live == Grant::ReadWrite;
     let stats = state.cache_read().stats(std::time::Instant::now());

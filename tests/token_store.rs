@@ -6,6 +6,7 @@ mod common;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
+use chrono::Duration;
 use common::{CLIENT_ID, StubEndpoint, config, pinned_now, temp_dir, write_token_file};
 use microsoft_todo_mcp::auth::entra::{TokenErrorBody, failure_from};
 use microsoft_todo_mcp::auth::store::{self, SaveMode, TokenFile};
@@ -34,13 +35,29 @@ fn provider(
     client_id: &str,
     scope: &str,
 ) -> Arc<TokenProvider> {
+    provider_with_clock(
+        dir,
+        endpoint,
+        client_id,
+        scope,
+        Arc::new(FixedClock::at(pinned_now())),
+    )
+}
+
+fn provider_with_clock(
+    dir: &std::path::Path,
+    endpoint: Arc<StubEndpoint>,
+    client_id: &str,
+    scope: &str,
+    clock: Arc<FixedClock>,
+) -> Arc<TokenProvider> {
     Arc::new(TokenProvider::new(
         Shared(endpoint),
         dir.to_path_buf(),
         client_id,
         AUTHORITY,
         scope,
-        Arc::new(FixedClock::at(pinned_now())),
+        clock,
     ))
 }
 
@@ -285,11 +302,6 @@ fn a_widening_asks_for_a_restart_only_when_the_configured_scope_allows_writes() 
 
         let st = p.status();
         assert_eq!(st.initial_grant, Grant::ReadOnly, "{configured}");
-        assert_eq!(
-            st.restart_reason.is_some(),
-            expect_restart,
-            "{configured}: {st:?}"
-        );
         if !expect_restart {
             assert_eq!(st.live_grant, Grant::ReadOnly, "capped: {st:?}");
             let live = st.live_scope.clone().unwrap_or_default();
@@ -297,7 +309,37 @@ fn a_widening_asks_for_a_restart_only_when_the_configured_scope_allows_writes() 
         } else {
             assert_eq!(st.live_grant, Grant::ReadWrite, "{st:?}");
         }
+        if expect_restart {
+            assert_ne!(p.live_grant(), p.initial_grant(), "{configured}");
+        } else {
+            assert_eq!(p.live_grant(), p.initial_grant(), "{configured}");
+        }
     }
+}
+
+#[test]
+fn refresh_failures_back_off_until_login_or_clock_expiry() {
+    let dir = temp_dir("refresh-backoff");
+    write_token_file(&dir, "RT-OLD", SCOPE);
+    let endpoint = Arc::new(StubEndpoint::new(SCOPE));
+    *endpoint.fail_with.lock().unwrap() = Some("offline".into());
+    let clock = Arc::new(FixedClock::at(pinned_now()));
+    let p = provider_with_clock(&dir, endpoint.clone(), CLIENT_ID, SCOPE, clock.clone());
+
+    assert!(matches!(p.access_token(), Err(AuthError::Transport(_))));
+    assert!(matches!(p.access_token(), Err(AuthError::Transport(_))));
+    assert_eq!(endpoint.calls(), 1);
+
+    let mut replacement = store::load(&dir).unwrap();
+    replacement.refresh_token = Secret::new("RT-NEW");
+    replacement.obtained_at = "2026-08-25T13:50:00.000000Z".into();
+    store::save_atomic(&dir, &replacement, None, SaveMode::Login).unwrap();
+    assert!(matches!(p.access_token(), Err(AuthError::Transport(_))));
+    assert_eq!(endpoint.calls(), 2);
+
+    clock.set(pinned_now() + Duration::seconds(31));
+    assert!(matches!(p.access_token(), Err(AuthError::Transport(_))));
+    assert_eq!(endpoint.calls(), 3);
 }
 
 fn token_success(scope: &str, refresh_token: Option<&str>) -> TokenSuccess {

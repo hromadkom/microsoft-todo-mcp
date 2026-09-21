@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Opt-in startup without a sign-in.** `TODO_MCP_START_WITHOUT_TOKEN=1` keeps
-  `serve` healthy for sidecar deployments when no token exists, Microsoft refuses
-  the sign-in, or Entra is unreachable. The tool list uses the configured ceiling,
-  dispatch follows the live grant through a lock-free atomic, and a later wider
-  login needs no restart. Corrupt token files and refused grants still refuse startup.
+- **Opt-in startup without a sign-in.** `TODO_MCP_START_WITHOUT_TOKEN=1` selects
+  follow mode whether or not the boot refresh succeeds. The tool list uses the
+  configured ceiling, later logins are picked up by writes and account status
+  without a restart, and failed refreshes back off for 30 seconds per token file.
+  Missing tokens, Microsoft refusals and unreachable Entra keep the listener healthy
+  with cause-specific tool errors; corrupt token files and refused grants still
+  refuse startup.
 
 ## [0.1.0] - 2026-09-15
 

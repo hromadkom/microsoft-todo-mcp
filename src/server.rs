@@ -14,7 +14,7 @@ use std::time::Instant;
 use chrono_tz::Tz;
 use serde_json::{Value, json};
 
-use crate::auth::{Grant, grant_from_scope};
+use crate::auth::Grant;
 use crate::cache::{Cache, truncate_bodies};
 use crate::clock::Clock;
 use crate::config::Config;
@@ -136,7 +136,7 @@ impl ServerState {
         boot_grant: Option<Grant>,
     ) -> Self {
         let tz = cfg.effective_tz();
-        let tools_grant = boot_grant.unwrap_or_else(|| grant_from_scope(&cfg.scope.requested()));
+        let tools_grant = boot_grant.unwrap_or_else(|| Grant::ceiling(cfg.scope));
         let tools = tools::build_tools(tools_grant, tz.name());
         let cache = Cache::new(cfg.cache_ttl_seconds, cfg.cache_max_tasks);
         Self {
@@ -157,6 +157,27 @@ impl ServerState {
     /// started without a sign-in — the latest successfully refreshed grant.
     pub fn effective_grant(&self) -> Option<Grant> {
         self.boot_grant.or_else(|| self.graph.tokens().live_grant())
+    }
+
+    pub fn boot_grant(&self) -> Option<Grant> {
+        self.boot_grant
+    }
+
+    pub fn restart_reason(&self) -> Option<String> {
+        self.restart_reason_for(self.graph.tokens().live_grant())
+    }
+
+    pub fn restart_reason_for(&self, live: Option<Grant>) -> Option<String> {
+        let (Some(boot), Some(live)) = (self.boot_grant, live) else {
+            return None;
+        };
+        (boot != live).then(|| {
+            format!(
+                "granted scope changed from {} to {} after startup",
+                boot.as_str(),
+                live.as_str()
+            )
+        })
     }
 
     /// The cache lock RESETS on poison instead of absorbing it (m4 §1.2).

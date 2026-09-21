@@ -193,9 +193,9 @@ hand-rolls a fixture Entra/Graph server on `tiny_http` (already a dependency), s
    log-hygiene parent asserts the child's stdout says `1 passed`, and the shutdown
    tests wait for the child's own log lines before signalling it.
 
-**205 tests per run: 113 unit** (in the lib; `main.rs` has none) **and 92
+**208 tests per run: 113 unit** (in the lib; `main.rs` has none) **and 95
 integration** — cli_smoke 10, graph_client 10, http_auth 2, shutdown 8 (one is the
-`child_process_entry` body, a no-op outside the child), token_store 14, tools_read 24,
+`child_process_entry` body, a no-op outside the child), token_store 15, tools_read 26,
 tools_write 24 — and 0 doctests. The count is the same under the host zone, under
 `TZ=Pacific/Kiritimati` and inside `docker build --target test .`.
 
@@ -336,7 +336,7 @@ and can print a task title.
 ## Status and where to start
 
 **Implemented and tested offline.** `auth/`, `graph/`, `domain/`, `cache.rs`,
-`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 201
+`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 208
 tests (see Tests) pass under the host zone, under `TZ=Pacific/Kiritimati` and inside
 `docker build --target test .`, with clippy `-D warnings`, `cargo fmt --check` and
 the ten gates green.
@@ -442,12 +442,12 @@ them):
   before its durable write leaves the old refresh token valid, and the kernel releases
   the flock.
 - **`serve` can optionally start before sign-in.** With
-  `TODO_MCP_START_WITHOUT_TOKEN=1`, missing tokens, Entra refusals and unreachable
-  Entra keep health checks available; corrupt token files and refused grants still
-  exit. It freezes the tool list at the configured scope ceiling, dispatch follows
-  the live grant through a lock-free atomic, and widening needs no restart; no poller
-  is needed because token access re-reads `token.json` whenever no access token is
-  cached.
+  `TODO_MCP_START_WITHOUT_TOKEN=1`, follow mode is selected whether or not the boot
+  refresh succeeds: missing tokens, Entra refusals and unreachable Entra keep health
+  checks available; corrupt token files and refused grants still exit. The tool list
+  is the configured scope ceiling, writes and account status pick up later logins
+  without a restart, and refresh failures back off for 30 seconds per token file.
+  No poller is needed because those calls compare the on-disk `token.json`.
 - **The drain polls rather than nudging.** `run_http` calls `server.unblock()` once;
   the other workers leave on their 500 ms `recv_timeout`, so an idle stop takes about
   0.7 s at most (200 ms supervisor poll + 500 ms), tested at 2 s. Nothing respawns

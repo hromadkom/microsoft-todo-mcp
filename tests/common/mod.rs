@@ -781,6 +781,13 @@ pub struct Harness {
     pub dir: std::path::PathBuf,
 }
 
+enum Boot {
+    Grant(Grant),
+    Refresh,
+    Unsigned,
+    FollowSigned,
+}
+
 pub fn harness(extra: &[(&str, &str)]) -> Harness {
     harness_with_grant(extra, Grant::ReadWrite)
 }
@@ -791,7 +798,7 @@ pub fn harness_with_grant(extra: &[(&str, &str)], grant: Grant) -> Harness {
         Grant::ReadOnly => "https://graph.microsoft.com/Tasks.Read offline_access",
         Grant::None => "offline_access",
     };
-    build_harness(extra, scope, Some(grant))
+    build_harness_inner(extra, scope, Boot::Grant(grant))
 }
 
 /// Boot the way `serve` does (`cli/commands.rs::serve`): one refresh through the
@@ -799,30 +806,24 @@ pub fn harness_with_grant(extra: &[(&str, &str)], grant: Grant) -> Harness {
 /// TODO_MCP_SCOPE cap and the `.All` refusal are exercised, not bypassed.
 /// `granted_scope` is what the stub token endpoint says Microsoft granted.
 pub fn harness_booted(extra: &[(&str, &str)], granted_scope: &str) -> Harness {
-    build_harness(extra, granted_scope, None)
+    build_harness_inner(extra, granted_scope, Boot::Refresh)
 }
 
-fn build_harness(extra: &[(&str, &str)], endpoint_scope: &str, grant: Option<Grant>) -> Harness {
-    build_harness_inner(extra, endpoint_scope, grant, true, false)
+pub fn harness_follow_signed(extra: &[(&str, &str)], endpoint_scope: &str) -> Harness {
+    build_harness_inner(extra, endpoint_scope, Boot::FollowSigned)
 }
 
 /// Build the opt-in startup state before a token has landed on disk.
 pub fn harness_unsigned(extra: &[(&str, &str)], endpoint_scope: &str) -> Harness {
-    build_harness_inner(extra, endpoint_scope, None, false, true)
+    build_harness_inner(extra, endpoint_scope, Boot::Unsigned)
 }
 
-fn build_harness_inner(
-    extra: &[(&str, &str)],
-    endpoint_scope: &str,
-    grant: Option<Grant>,
-    write_token: bool,
-    unsigned: bool,
-) -> Harness {
+fn build_harness_inner(extra: &[(&str, &str)], endpoint_scope: &str, boot: Boot) -> Harness {
     let fx = Fixture::start();
     let dir = temp_dir("harness");
     let cfg = config(&dir, extra);
     let requested = cfg.scope.requested();
-    if write_token {
+    if !matches!(boot, Boot::Unsigned) {
         write_token_file(&dir, "RT-OLD", &requested);
     }
     let clock = Arc::new(FixedClock::at(pinned_now()));
@@ -841,17 +842,17 @@ fn build_harness_inner(
         &requested,
         clock.clone(),
     ));
-    let boot_grant = if unsigned {
-        tokens.follow_live_grant();
-        None
-    } else {
-        match grant {
-            Some(g) => Some(g),
-            None => {
-                tokens.access_token().expect("boot refresh");
-                Some(tokens.initial_grant().expect("grant after boot"))
-            }
+    let boot_grant = match boot {
+        Boot::Grant(g) => Some(g),
+        Boot::Refresh => {
+            tokens.access_token().expect("boot refresh");
+            Some(tokens.initial_grant().expect("grant after boot"))
         }
+        Boot::FollowSigned => {
+            tokens.access_token().expect("boot refresh");
+            None
+        }
+        Boot::Unsigned => None,
     };
     let sleeps = Arc::new(Mutex::new(Vec::new()));
     let s2 = sleeps.clone();

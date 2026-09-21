@@ -72,6 +72,10 @@ Consequences:
 - When Microsoft reports the refresh token dead during a refresh (AADSTS70008, 700082
   or 530036), `serve` and `doctor` delete `token.json`, but only if no newer sign-in has
   replaced it in the meantime.
+- In follow mode (`TODO_MCP_START_WITHOUT_TOKEN=1`), a later `login` is noticed by the
+  next write or account-status call without a restart. A transient refresh failure is
+  retried at most every 30 seconds for the same `token.json`; replacing that file retries
+  immediately.
 
 ### Why a leaked refresh token outlives rotation
 

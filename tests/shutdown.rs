@@ -177,6 +177,27 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
+fn data_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("todo-mcp-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .expect("data dir");
+    dir
+}
+
+fn serve_cmd(dir: &std::path::Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_todo-mcp"));
+    cmd.env_clear()
+        .arg("serve")
+        .env("TODO_MCP_CLIENT_ID", "00000000-0000-0000-0000-000000000000")
+        .env("TODO_MCP_DATA_DIR", dir)
+        .env("TODO_MCP_BIND", "127.0.0.1:0")
+        .env("TODO_MCP_TZ", "UTC");
+    cmd
+}
+
 fn rpc(base: &str, bearer: &str, body: &str) -> Value {
     let auth = format!("Bearer {bearer}");
     let mut response = agent()
@@ -211,24 +232,9 @@ fn call_in_background(base: &str) -> JoinHandle<CallResult> {
 #[test]
 fn serve_without_a_token_stays_up_and_serves_healthz_when_opted_in() {
     for (scope, expected_tools) in [("Tasks.ReadWrite", 10), ("Tasks.Read", 5)] {
-        let dir = std::env::temp_dir().join(format!(
-            "todo-mcp-start-without-token-{}-{scope}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .expect("data dir");
-
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_todo-mcp"));
-        cmd.env_clear()
-            .arg("serve")
-            .env("TODO_MCP_CLIENT_ID", "00000000-0000-0000-0000-000000000000")
-            .env("TODO_MCP_DATA_DIR", &dir)
-            .env("TODO_MCP_BIND", "127.0.0.1:0")
-            .env("TODO_MCP_TZ", "UTC")
-            .env("TODO_MCP_SCOPE", scope)
+        let dir = data_dir(&format!("start-without-token-{scope}"));
+        let mut cmd = serve_cmd(&dir);
+        cmd.env("TODO_MCP_SCOPE", scope)
             .env("TODO_MCP_START_WITHOUT_TOKEN", "1");
         let mut p = Proc::spawn(cmd);
         let base = base_url(&mut p);
@@ -287,25 +293,11 @@ fn serve_without_a_token_stays_up_and_serves_healthz_when_opted_in() {
 
 #[test]
 fn start_without_token_does_not_swallow_a_corrupt_token_store() {
-    let dir = std::env::temp_dir().join(format!(
-        "todo-mcp-start-without-token-corrupt-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .expect("data dir");
+    let dir = data_dir("start-without-token-corrupt");
     std::fs::write(dir.join("token.json"), "{}").expect("corrupt token");
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_todo-mcp"));
-    cmd.env_clear()
-        .arg("serve")
-        .env("TODO_MCP_CLIENT_ID", "00000000-0000-0000-0000-000000000000")
-        .env("TODO_MCP_DATA_DIR", &dir)
-        .env("TODO_MCP_BIND", "127.0.0.1:0")
-        .env("TODO_MCP_TZ", "UTC")
-        .env("TODO_MCP_START_WITHOUT_TOKEN", "1");
+    let mut cmd = serve_cmd(&dir);
+    cmd.env("TODO_MCP_START_WITHOUT_TOKEN", "1");
     let mut p = Proc::spawn(cmd);
     let status = p.exit_within(STARTUP);
     assert_ne!(status.code(), Some(0), "{status:?}");
@@ -319,13 +311,7 @@ fn start_without_token_does_not_swallow_a_corrupt_token_store() {
 #[test]
 fn a_signal_during_the_boot_refresh_exits_zero_at_once() {
     for sig in ["TERM", "INT"] {
-        let dir =
-            std::env::temp_dir().join(format!("todo-mcp-shutdown-{}-{sig}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .expect("data dir");
+        let dir = data_dir(&format!("shutdown-{sig}"));
         // Hold the token-store lock: `serve` gets past config, the /data probe
         // and the bearer, then blocks inside `access_token()`, the boot refresh.
         let lock = std::fs::OpenOptions::new()
@@ -337,13 +323,7 @@ fn a_signal_during_the_boot_refresh_exits_zero_at_once() {
             .expect("lock file");
         lock.lock().expect("flock");
 
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_todo-mcp"));
-        cmd.env_clear()
-            .arg("serve")
-            .env("TODO_MCP_CLIENT_ID", "00000000-0000-0000-0000-000000000000")
-            .env("TODO_MCP_DATA_DIR", &dir)
-            .env("TODO_MCP_BIND", "127.0.0.1:0")
-            .env("TODO_MCP_TZ", "UTC");
+        let cmd = serve_cmd(&dir);
         let mut p = Proc::spawn(cmd);
         p.wait_for("generated a new MCP bearer token");
         assert!(p.running(), "serve should be parked on .token.lock");

@@ -9,8 +9,8 @@ use chrono::{Duration, TimeZone, Utc};
 use serde_json::{Value, json};
 
 use common::{
-    Override, harness, harness_booted, harness_unsigned, pinned_now, seed_22_lists,
-    write_token_file,
+    Override, harness, harness_booted, harness_follow_signed, harness_unsigned, pinned_now,
+    seed_22_lists, write_token_file,
 };
 use microsoft_todo_mcp::auth::Grant;
 use microsoft_todo_mcp::cache::log_ref;
@@ -117,8 +117,13 @@ fn an_unsigned_server_follows_a_widened_grant_without_restart() {
 
     *h.endpoint.scope.lock().unwrap() = Some(RW_SCOPE.to_string());
     write_token_file(&h.dir, "RT-NEW", RW_SCOPE);
-    h.clock.set(pinned_now() + Duration::seconds(3600));
-    let status = h.call("todo_account_status", json!({"check_connectivity": true}));
+    let write = h.call(
+        "todo_create_tasks",
+        json!({"list": "Tasks", "tasks": [{"title": "x"}]}),
+    );
+    assert!(write.get("isError").is_none(), "{write}");
+    assert_eq!(h.endpoint.calls(), 2);
+    let status = h.call("todo_account_status", json!({}));
     assert_eq!(
         status["structuredContent"]["restart_required"], false,
         "{status}"
@@ -127,12 +132,48 @@ fn an_unsigned_server_follows_a_widened_grant_without_restart() {
         status["structuredContent"]["grant"], "Tasks.ReadWrite",
         "{status}"
     );
+}
+
+#[test]
+fn an_unsigned_server_refuses_a_newly_narrowed_consent_before_graph() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+    h.fx.reset_log();
+    *h.endpoint.scope.lock().unwrap() = Some(READ_SCOPE.to_string());
+    write_token_file(&h.dir, "RT-NEW", RW_SCOPE);
 
     let write = h.call(
         "todo_create_tasks",
         json!({"list": "Tasks", "tasks": [{"title": "x"}]}),
     );
+    assert_eq!(write["isError"], true, "{write}");
+    let text = write["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("current Microsoft Graph grant is `Tasks.Read`"),
+        "{text}"
+    );
+    assert!(
+        text.contains("next write call picks the new grant up"),
+        "{text}"
+    );
+    assert_eq!(h.fx.count_matching("POST", "/tasks"), 0);
+}
+
+#[test]
+fn follow_signed_readwrite_has_ten_tools_and_does_not_redeem_on_write() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    assert_eq!(h.state.list_tools().as_array().unwrap().len(), 10);
+    let before = h.endpoint.calls();
+    h.fx.add_list("Tasks", Some("defaultList"));
+    let write = h.call(
+        "todo_create_tasks",
+        json!({"list": "Tasks", "tasks": [{"title": "x"}]}),
+    );
     assert!(write.get("isError").is_none(), "{write}");
+    assert_eq!(h.endpoint.calls(), before);
+
+    let h = harness_follow_signed(&[("TODO_MCP_SCOPE", "Tasks.Read")], RW_SCOPE);
+    assert_eq!(h.state.list_tools().as_array().unwrap().len(), 5);
 }
 
 #[test]

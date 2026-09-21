@@ -52,36 +52,54 @@ pub fn build_tools(grant: Grant, tz: &str) -> Value {
     Value::Array(keep)
 }
 
+fn narrow_grant_refusal(grant: Grant, frozen: bool) -> String {
+    if frozen {
+        format!(
+            "Refused: the current Microsoft Graph grant is `{}`. Write tools require Tasks.ReadWrite. To enable them, {LOGIN_HINT}. {RESTART_HINT}.",
+            grant.as_str()
+        )
+    } else {
+        format!(
+            "Refused: the current Microsoft Graph grant is `{}`. Write tools require Tasks.ReadWrite. To enable them, {LOGIN_HINT}; the next write call picks the new grant up without a restart.",
+            grant.as_str()
+        )
+    }
+}
+
 pub fn dispatch(state: &ServerState, name: &str, args: &Value) -> Result<Value, RpcError> {
     if !args.is_object() {
         return Ok(render::error("arguments must be a JSON object".into()));
     }
-    let mut grant = state.effective_grant();
-    if WRITE_TOOLS.contains(&name) && grant.is_none() && state.cfg.scope != ScopeChoice::Read {
-        match state.graph.tokens().access_token() {
-            Ok(_) => grant = state.effective_grant(),
-            Err(e) => return Ok(render::failure(&AppError::from_auth(&e), state)),
+    let is_write = WRITE_TOOLS.contains(&name);
+    if is_write && state.cfg.scope == ScopeChoice::Read {
+        // Under a Read config the grant is capped at Tasks.Read (auth::vet_grant),
+        // so another login cannot enable write tools without changing config.
+        return Ok(render::error(READ_ONLY_REFUSAL.into()));
+    }
+    if is_write {
+        let grant = match state.boot_grant() {
+            Some(g) => Some(g),
+            None => match state.graph.tokens().access_token_after_login() {
+                Ok(_) => state.graph.tokens().live_grant(),
+                Err(e) => return Ok(render::failure(&AppError::from_auth(&e), state)),
+            },
+        };
+        match grant {
+            Some(Grant::ReadWrite) => {}
+            Some(g) => {
+                return Ok(render::error(narrow_grant_refusal(
+                    g,
+                    state.boot_grant().is_some(),
+                )));
+            }
+            None => {
+                return Ok(render::error(narrow_grant_refusal(
+                    Grant::None,
+                    state.boot_grant().is_some(),
+                )));
+            }
         }
     }
-    match grant {
-        Some(g) if WRITE_TOOLS.contains(&name) && g != Grant::ReadWrite => {
-            // Under a Read config the grant is capped at Tasks.Read (auth::vet_grant),
-            // so "re-run login and restart" would change nothing.
-            let text = if state.cfg.scope == ScopeChoice::Read {
-                READ_ONLY_REFUSAL.to_string()
-            } else {
-                format!(
-                    "Refused: the current Microsoft Graph grant is `{}`. Write tools require Tasks.ReadWrite. To enable them, {LOGIN_HINT}. {RESTART_HINT}.",
-                    g.as_str()
-                )
-            };
-            return Ok(render::error(text));
-        }
-        None if WRITE_TOOLS.contains(&name) && state.cfg.scope == ScopeChoice::Read => {
-            return Ok(render::error(READ_ONLY_REFUSAL.to_string()));
-        }
-        _ => {}
-    };
     let result = match name {
         "todo_lists" => read::todo_lists(state, args),
         "todo_search_tasks" => read::todo_search_tasks(state, args),

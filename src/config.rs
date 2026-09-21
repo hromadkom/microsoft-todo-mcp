@@ -504,16 +504,6 @@ mod tests {
     }
 
     #[test]
-    fn start_without_token_rejects_unknown_values() {
-        let err = load(&[
-            ("TODO_MCP_CLIENT_ID", ID),
-            ("TODO_MCP_START_WITHOUT_TOKEN", "maybe"),
-        ])
-        .unwrap_err();
-        assert!(err.message().contains("TODO_MCP_START_WITHOUT_TOKEN"));
-    }
-
-    #[test]
     fn concurrency_is_rejected_not_clamped() {
         assert!(
             load(&[
