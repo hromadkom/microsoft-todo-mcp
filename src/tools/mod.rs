@@ -35,6 +35,8 @@ pub const WRITE_TOOLS: [&str; 5] = [
     "todo_manage_checklist",
 ];
 
+const READ_ONLY_REFUSAL: &str = "Refused: this server is configured read-only (TODO_MCP_SCOPE=Tasks.Read), so write tools are not available and restarting will not change that. To enable them the operator sets TODO_MCP_SCOPE=Tasks.ReadWrite, runs login again, then restarts the server.";
+
 /// `tools/list` for a grant: 10 under `ReadWrite`, 5 otherwise. Computed once
 /// at construction and frozen (m6 §7); startup without a token uses the
 /// configured scope ceiling here.
@@ -66,7 +68,7 @@ pub fn dispatch(state: &ServerState, name: &str, args: &Value) -> Result<Value, 
             // Under a Read config the grant is capped at Tasks.Read (auth::vet_grant),
             // so "re-run login and restart" would change nothing.
             let text = if state.cfg.scope == ScopeChoice::Read {
-                "Refused: this server is configured read-only (TODO_MCP_SCOPE=Tasks.Read), so write tools are not available and restarting will not change that. To enable them the operator sets TODO_MCP_SCOPE=Tasks.ReadWrite, runs login again, then restarts the server.".to_string()
+                READ_ONLY_REFUSAL.to_string()
             } else {
                 format!(
                     "Refused: the current Microsoft Graph grant is `{}`. Write tools require Tasks.ReadWrite. To enable them, {LOGIN_HINT}. {RESTART_HINT}.",
@@ -76,8 +78,7 @@ pub fn dispatch(state: &ServerState, name: &str, args: &Value) -> Result<Value, 
             return Ok(render::error(text));
         }
         None if WRITE_TOOLS.contains(&name) && state.cfg.scope == ScopeChoice::Read => {
-            let text = "Refused: this server is configured read-only (TODO_MCP_SCOPE=Tasks.Read), so write tools are not available and restarting will not change that. To enable them the operator sets TODO_MCP_SCOPE=Tasks.ReadWrite, runs login again, then restarts the server.".to_string();
-            return Ok(render::error(text));
+            return Ok(render::error(READ_ONLY_REFUSAL.to_string()));
         }
         _ => {}
     };
