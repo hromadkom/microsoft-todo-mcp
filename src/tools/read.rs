@@ -923,18 +923,14 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
         json!({ "checked": false, "ok": Value::Null, "detail": Value::Null })
     };
     let ts = state.graph.tokens().status();
-    let eff = if state.follows_logins() {
-        ts.live_scope.is_some().then_some(ts.live_grant)
-    } else {
-        state.boot_grant()
-    };
+    let eff = state.effective_grant();
     let live = if ts.live_scope.is_some() {
         ts.live_grant
     } else {
         eff.unwrap_or(Grant::None)
     };
     let restart_reason = state.restart_reason_for(ts.live_scope.is_some().then_some(ts.live_grant));
-    let write_enabled = eff == Some(Grant::ReadWrite);
+    let write_enabled = eff == Some(Grant::ReadWrite) && ts.live_scope.is_some();
     let widened = !write_enabled && live == Grant::ReadWrite;
     let stats = state.cache_read().stats(std::time::Instant::now());
     let gs = state.graph.stats();

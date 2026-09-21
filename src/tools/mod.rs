@@ -68,9 +68,7 @@ fn narrow_grant_refusal(grant: Grant, frozen: bool) -> String {
 
 pub fn dispatch(state: &ServerState, name: &str, args: &Value) -> Result<Value, RpcError> {
     state.observe_token();
-    let result = dispatch_inner(state, name, args);
-    state.observe_token();
-    result
+    dispatch_inner(state, name, args)
 }
 
 fn dispatch_inner(state: &ServerState, name: &str, args: &Value) -> Result<Value, RpcError> {
@@ -83,21 +81,21 @@ fn dispatch_inner(state: &ServerState, name: &str, args: &Value) -> Result<Value
         // so another login cannot enable write tools without changing config.
         return Ok(render::error(READ_ONLY_REFUSAL.into()));
     }
-    if is_write {
-        let grant = if state.follows_logins() {
-            match state.graph.tokens().access_token_with_grant() {
-                Ok((_, g)) => g,
-                Err(e) => return Ok(render::failure(&AppError::from_auth(&e), state)),
-            }
-        } else {
-            state.boot_grant().unwrap_or(Grant::None)
-        };
-        if grant != Grant::ReadWrite {
-            return Ok(render::error(narrow_grant_refusal(
-                grant,
-                !state.follows_logins(),
-            )));
+    let mut grant = state.effective_grant();
+    if is_write && grant.is_none() {
+        match state.graph.tokens().access_token() {
+            Ok(_) => grant = state.effective_grant(),
+            Err(e) => return Ok(render::failure(&AppError::from_auth(&e), state)),
         }
+    }
+    if let Some(grant) = grant
+        && is_write
+        && grant != Grant::ReadWrite
+    {
+        return Ok(render::error(narrow_grant_refusal(
+            grant,
+            !state.follows_logins(),
+        )));
     }
     let result = match name {
         "todo_lists" => read::todo_lists(state, args),

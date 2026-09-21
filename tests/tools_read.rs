@@ -193,12 +193,57 @@ fn follow_mode_account_switch_resets_cache_before_refetch() {
     assert!(first.get("isError").is_none(), "{first}");
     let before = h.graph_requests();
     let mut replacement = store::load(&h.dir).expect("token");
+    replacement.account_id = "switched".into();
     replacement.refresh_token = Secret::new("RT-SWITCHED");
     replacement.obtained_at = "2026-08-25T13:50:05.113000Z".into();
     store::save_atomic(&h.dir, &replacement, None, SaveMode::Login).expect("switch account");
     let second = h.call("todo_lists", json!({}));
     assert!(second.get("isError").is_none(), "{second}");
     assert!(h.graph_requests() > before, "cache was not reset: {second}");
+}
+
+#[test]
+fn follow_mode_refresh_rotation_keeps_cache_and_token_state() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+    let first = h.call("todo_lists", json!({}));
+    assert!(first.get("isError").is_none(), "{first}");
+    let before = h.graph_requests();
+    let mut rotation = store::load(&h.dir).expect("token");
+    rotation.obtained_at = "2026-08-25T13:50:05.113000Z".into();
+    rotation.obtained_by = "refresh".into();
+    store::save_atomic(&h.dir, &rotation, None, SaveMode::Login).expect("rotate");
+    let second = h.call("todo_lists", json!({}));
+    assert!(second.get("isError").is_none(), "{second}");
+    assert_eq!(h.graph_requests(), before, "rotation reset the warm cache");
+}
+
+#[test]
+fn frozen_mode_logout_keeps_boot_grant_but_disables_writes() {
+    let h = harness(&[]);
+    std::fs::remove_file(h.dir.join("token.json")).expect("logout");
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["token"]["present"], false,
+        "{status}"
+    );
+    assert_eq!(
+        status["structuredContent"]["grant"], "Tasks.ReadWrite",
+        "{status}"
+    );
+    assert_eq!(
+        status["structuredContent"]["write_tools_enabled"], false,
+        "{status}"
+    );
+    let write = h.call("todo_create_tasks", json!({"tasks": [{"title": "x"}]}));
+    assert_eq!(write["isError"], true, "{write}");
+    assert!(
+        write["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("auth_required"),
+        "{write}"
+    );
 }
 
 #[test]
@@ -686,7 +731,7 @@ fn account_status_makes_no_me_call_and_reports_the_grant() {
         login.contains("`docker compose run --rm todo-mcp login`"),
         "{r}"
     );
-    assert_eq!(r["write_tools_enabled"], true);
+    assert_eq!(r["write_tools_enabled"], false);
     assert_eq!(r["restart_required"], false);
     assert_eq!(h.graph_requests(), 0);
     let r = h.ok("todo_account_status", json!({ "check_connectivity": true }));

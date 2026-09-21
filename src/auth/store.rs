@@ -13,6 +13,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,27 @@ use crate::errors::LOGIN_HINT;
 pub const SCHEMA_VERSION: u32 = 1;
 pub const TOKEN_FILE: &str = "token.json";
 const LOCK_FILE: &str = ".token.lock";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FileSeen {
+    #[default]
+    Unknown,
+    Absent,
+    Present {
+        mtime: Option<SystemTime>,
+        len: Option<u64>,
+    },
+}
+
+pub fn observe(dir: &Path) -> FileSeen {
+    match fs::metadata(dir.join(TOKEN_FILE)) {
+        Ok(meta) => FileSeen::Present {
+            mtime: meta.modified().ok(),
+            len: Some(meta.len()),
+        },
+        Err(_) => FileSeen::Absent,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenFile {
@@ -103,7 +125,7 @@ pub enum SaveMode {
 }
 
 pub enum SaveOutcome {
-    Wrote,
+    Wrote(FileSeen),
     /// The disk held a newer token; here it is. The caller's token is discarded.
     Adopted(Box<TokenFile>),
 }
@@ -216,7 +238,7 @@ pub fn save_atomic(
     if let Ok(d) = File::open(dir) {
         let _ = d.sync_all();
     }
-    Ok(SaveOutcome::Wrote)
+    Ok(SaveOutcome::Wrote(observe(dir)))
 }
 
 /// `logout`: remove the token file and any stale tmp files, under the
@@ -263,16 +285,16 @@ pub fn delete(dir: &Path) -> Result<bool, StoreError> {
 /// ONLY while `token.json` is still the file the refresh started from
 /// (`obtained_at` equal to `base`'s): a `login` that landed during the failing
 /// redeem must win, exactly as `SaveMode::Login` does. Returns whether it deleted;
-/// `Ok(false)` means the disk now holds a different token.json, or none.
+/// `Ok(None)` means the disk now holds a different token.json, or none.
 ///
 /// Like [`delete`] it never removes `.token.lock`. Unlinking a flock file that
 /// another process holds or waits on lets a newcomer lock a fresh inode, and two
 /// processes would then be inside the critical section at once.
-pub fn delete_if_unchanged(dir: &Path, base: &TokenFile) -> Result<bool, StoreError> {
+pub fn delete_if_unchanged(dir: &Path, base: &TokenFile) -> Result<Option<FileSeen>, StoreError> {
     let _lock = lock_file(dir)?;
     match read_unlocked(dir) {
         Ok(disk) if disk.obtained_at == base.obtained_at => {}
-        Ok(_) | Err(StoreError::NotFound) => return Ok(false),
+        Ok(_) | Err(StoreError::NotFound) => return Ok(None),
         Err(e) => return Err(e),
     }
     fs::remove_file(dir.join(TOKEN_FILE))?;
@@ -291,7 +313,7 @@ pub fn delete_if_unchanged(dir: &Path, base: &TokenFile) -> Result<bool, StoreEr
     if let Ok(d) = File::open(dir) {
         let _ = d.sync_all();
     }
-    Ok(true)
+    Ok(Some(observe(dir)))
 }
 
 /// Mode bits of `token.json`, for `doctor`.
@@ -335,7 +357,7 @@ mod tests {
         let f = file("RT-1", "2026-08-25T13:49:05.113000Z");
         assert!(matches!(
             save_atomic(&dir, &f, None, SaveMode::Login).unwrap(),
-            SaveOutcome::Wrote
+            SaveOutcome::Wrote(_)
         ));
         let mode = fs::metadata(dir.join(TOKEN_FILE)).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -360,14 +382,14 @@ mod tests {
         let mine = file("RT-MINE", "2026-08-25T13:49:07.000000Z");
         match save_atomic(&dir, &mine, Some(&base), SaveMode::Refresh).unwrap() {
             SaveOutcome::Adopted(disk) => assert_eq!(disk.refresh_token.expose(), "RT-NEW"),
-            SaveOutcome::Wrote => panic!("must adopt"),
+            SaveOutcome::Wrote(_) => panic!("must adopt"),
         }
         assert_eq!(load(&dir).unwrap().refresh_token.expose(), "RT-NEW");
         // Login mode ignores the CAS.
         let login = file("RT-LOGIN", "2026-08-25T13:49:00.000000Z");
         assert!(matches!(
             save_atomic(&dir, &login, Some(&base), SaveMode::Login).unwrap(),
-            SaveOutcome::Wrote
+            SaveOutcome::Wrote(_)
         ));
         assert_eq!(load(&dir).unwrap().refresh_token.expose(), "RT-LOGIN");
         let _ = fs::remove_dir_all(&dir);
@@ -447,16 +469,19 @@ mod tests {
         // A login lands after the refresh read `base`: nothing is touched.
         let login = file("RT-NEW", "2026-08-25T13:49:06.000000Z");
         save_atomic(&dir, &login, None, SaveMode::Login).unwrap();
-        assert!(!delete_if_unchanged(&dir, &base).unwrap());
+        assert!(delete_if_unchanged(&dir, &base).unwrap().is_none());
         assert_eq!(load(&dir).unwrap().refresh_token.expose(), "RT-NEW");
         assert!(dir.join("token.json.tmp.1.1").exists());
         // Unchanged since it was read: token.json and tmp debris go, the lock stays.
-        assert!(delete_if_unchanged(&dir, &login).unwrap());
+        assert_eq!(
+            delete_if_unchanged(&dir, &login).unwrap(),
+            Some(FileSeen::Absent)
+        );
         assert!(!dir.join(TOKEN_FILE).exists());
         assert!(!dir.join("token.json.tmp.1.1").exists());
         assert!(dir.join(LOCK_FILE).exists());
         // Nothing left to delete.
-        assert!(!delete_if_unchanged(&dir, &login).unwrap());
+        assert!(delete_if_unchanged(&dir, &login).unwrap().is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

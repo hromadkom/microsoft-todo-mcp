@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use microsoft_todo_mcp::auth::store::{self, SaveMode, TokenFile};
 use microsoft_todo_mcp::auth::{
-    AuthError, Grant, Secret, TokenEndpoint, TokenProvider, TokenSuccess,
+    AuthError, Grant, GrantLog, Secret, TokenEndpoint, TokenProvider, TokenSuccess,
 };
 use microsoft_todo_mcp::clock::FixedClock;
 use microsoft_todo_mcp::config::{Config, Need, load_config};
@@ -854,6 +854,7 @@ fn build_harness_inner(extra: &[(&str, &str)], endpoint_scope: &str, boot: Boot)
         &cfg.authority(),
         &requested,
         clock.clone(),
+        GrantLog::Silent,
     ));
     let boot_grant = match boot {
         Boot::Grant(g) => Some(g),

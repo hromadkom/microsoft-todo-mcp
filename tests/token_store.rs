@@ -11,7 +11,7 @@ use common::{CLIENT_ID, StubEndpoint, config, pinned_now, temp_dir, write_token_
 use microsoft_todo_mcp::auth::entra::{TokenErrorBody, failure_from};
 use microsoft_todo_mcp::auth::store::{self, SaveMode, TokenFile};
 use microsoft_todo_mcp::auth::{
-    AuthError, Grant, Secret, TokenEndpoint, TokenProvider, TokenSuccess,
+    AuthError, Grant, GrantLog, Secret, TokenEndpoint, TokenProvider, TokenSuccess,
 };
 use microsoft_todo_mcp::cli::commands::{LoginOutcome, finish_login};
 use microsoft_todo_mcp::cli::exit;
@@ -58,6 +58,7 @@ fn provider_with_clock(
         AUTHORITY,
         scope,
         clock,
+        GrantLog::Silent,
     ))
 }
 
@@ -341,7 +342,7 @@ fn refresh_failures_back_off_until_login_or_clock_expiry() {
     assert_eq!(endpoint.calls(), 1);
 
     let mut replacement = store::load(&dir).unwrap();
-    replacement.refresh_token = Secret::new("RT-NEW");
+    replacement.refresh_token = Secret::new("RT-NEWER");
     replacement.obtained_at = "2026-08-25T13:50:00.000000Z".into();
     store::save_atomic(&dir, &replacement, None, SaveMode::Login).unwrap();
     let r = p.access_token();
@@ -490,6 +491,7 @@ fn finish_login_under_a_read_config_saves_and_reports_the_capped_grant() {
 /// parks inside the "network call" first, so a test can land a `login` there.
 struct Refuses {
     code: i64,
+    succeed_first: bool,
     barrier: Option<Arc<Barrier>>,
     calls: Arc<AtomicUsize>,
     seen_rts: Arc<Mutex<Vec<String>>>,
@@ -499,6 +501,7 @@ impl Refuses {
     fn new(code: i64) -> Self {
         Self {
             code,
+            succeed_first: false,
             barrier: None,
             calls: Arc::default(),
             seen_rts: Arc::default(),
@@ -508,8 +511,11 @@ impl Refuses {
 
 impl TokenEndpoint for Refuses {
     fn redeem_refresh_token(&self, rt: &str, _scope: &str) -> Result<TokenSuccess, AuthError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         self.seen_rts.lock().unwrap().push(rt.to_string());
+        if self.succeed_first && call == 1 {
+            return Ok(token_success(_scope, Some("RT-NEW")));
+        }
         if let Some(b) = &self.barrier {
             b.wait();
         }
@@ -532,7 +538,34 @@ fn refusing_provider(dir: &std::path::Path, endpoint: Refuses) -> TokenProvider 
         AUTHORITY,
         SCOPE,
         Arc::new(FixedClock::at(pinned_now())),
+        GrantLog::Silent,
     )
+}
+
+#[test]
+fn a_non_deleting_entra_refusal_keeps_a_still_valid_cached_token() {
+    let dir = temp_dir("entra-fallback");
+    write_token_file(&dir, "RT-OLD", SCOPE);
+    let endpoint = Refuses {
+        succeed_first: true,
+        ..Refuses::new(9002313)
+    };
+    let calls = endpoint.calls.clone();
+    let clock = Arc::new(FixedClock::at(pinned_now()));
+    let p = TokenProvider::new(
+        endpoint,
+        dir.clone(),
+        CLIENT_ID,
+        AUTHORITY,
+        SCOPE,
+        clock.clone(),
+        GrantLog::Silent,
+    );
+    let first = p.access_token().expect("initial token");
+    clock.set(pinned_now() + Duration::seconds(3590));
+    let second = p.access_token().expect("cached token after refusal");
+    assert_eq!(first.expose(), second.expose());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]

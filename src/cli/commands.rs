@@ -13,7 +13,7 @@ use crate::auth::device_code::{self, LoginIo};
 use crate::auth::entra::EntraClient;
 use crate::auth::store::{self, SaveMode, TokenFile};
 use crate::auth::{
-    AuthError, Grant, REVOKE_CONSENT_PATHS, TokenProvider, TokenSuccess, audit_scope,
+    AuthError, Grant, GrantLog, REVOKE_CONSENT_PATHS, TokenProvider, TokenSuccess, audit_scope,
     effective_scope, forbidden_scope_message, grant_from_scope, keeps_serving_without_token,
     scope_short_names, stored_forbidden_scope_message, vet_grant,
 };
@@ -154,7 +154,7 @@ fn signal_refusal(name: &str, e: &std::io::Error) -> AppError {
     ))
 }
 
-fn token_provider(cfg: &Config) -> TokenProvider {
+fn token_provider(cfg: &Config, mode: GrantLog) -> TokenProvider {
     let entra = EntraClient::new(&cfg.authority(), &cfg.client_id, cfg.http_timeout_ms);
     TokenProvider::new(
         entra,
@@ -163,6 +163,7 @@ fn token_provider(cfg: &Config) -> TokenProvider {
         &cfg.authority(),
         &cfg.scope.requested(),
         Arc::new(SystemClock),
+        mode,
     )
 }
 
@@ -182,7 +183,15 @@ pub fn serve() -> Result<i32, AppError> {
     let bearer = load_or_create_bearer(&cfg.bearer_file)?;
 
     // The opt-in flag selects follow mode even when the boot refresh succeeds.
-    let tokens = Arc::new(token_provider(&cfg));
+    let mode = if cfg.start_without_token {
+        GrantLog::Follow
+    } else {
+        GrantLog::Frozen
+    };
+    let tokens = Arc::new(token_provider(&cfg, mode));
+    if cfg.start_without_token {
+        tokens.follow_live_grant();
+    }
     let boot = match tokens.access_token() {
         Ok(_) => {
             let grant = tokens.initial_grant().unwrap_or(Grant::None);
@@ -217,17 +226,6 @@ pub fn serve() -> Result<i32, AppError> {
     };
     let signed_in = boot.is_some();
     let boot_grant = if cfg.start_without_token { None } else { boot };
-    // Once, at boot, and only scope names: extra granted scopes are warned about
-    // the same way login and doctor do.
-    let startup_status = tokens.status();
-    if signed_in
-        && let Some(w) = startup_status
-            .live_scope
-            .as_deref()
-            .and_then(|s| audit_scope(s, &cfg.scope.requested()).warning())
-    {
-        logger::warn(&w, &[]);
-    }
     let prefer_tz =
         crate::domain::datetime::prefer_tz_value(cfg.effective_tz()).map(str::to_string);
     let transport = UreqTransport::new(cfg.http_timeout_ms, cfg.max_response_bytes);
@@ -240,6 +238,7 @@ pub fn serve() -> Result<i32, AppError> {
         prefer_tz,
     );
     let state = ServerState::new(cfg.clone(), graph, Arc::new(SystemClock), boot_grant);
+    let startup_status = tokens.status();
     let tools = state.tools.as_array().map_or(0, Vec::len);
     let mcp = Arc::new(McpServer {
         name: "microsoft-todo-mcp",
@@ -662,7 +661,7 @@ pub fn doctor(verbose: bool) -> Result<i32, AppError> {
     {
         out::line("");
         out::line("microsoft graph");
-        let tokens = Arc::new(token_provider(&cfg));
+        let tokens = Arc::new(token_provider(&cfg, GrantLog::Silent));
         match tokens.access_token() {
             Ok(_) => {
                 let st = tokens.status();
