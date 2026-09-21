@@ -15,6 +15,7 @@ use common::{
 use microsoft_todo_mcp::auth::store::{self, SaveMode};
 use microsoft_todo_mcp::auth::{Grant, Secret};
 use microsoft_todo_mcp::cache::log_ref;
+use microsoft_todo_mcp::errors::RESTART_HINT;
 use microsoft_todo_mcp::mcp::ToolProvider;
 
 const RW_SCOPE: &str = "https://graph.microsoft.com/Tasks.ReadWrite offline_access";
@@ -82,6 +83,7 @@ fn an_unsigned_server_refuses_writes_after_a_narrower_grant_lands() {
         text.contains("current Microsoft Graph grant is `Tasks.Read`"),
         "{text}"
     );
+    assert!(!text.contains(RESTART_HINT), "{text}");
 }
 
 #[test]

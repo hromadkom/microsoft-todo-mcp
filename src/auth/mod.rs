@@ -592,11 +592,7 @@ impl TokenProvider {
 
     pub fn access_token_with_grant(&self) -> Result<(Secret, Grant), AuthError> {
         self.notice_token_file();
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let seen = observe_file(&self.dir);
-        if st.file_seen != FileSeen::Unknown && st.file_seen != seen {
-            self.reset_state_for_file(&mut st, seen);
-        }
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.refresh_locked(st, self.clock.now())
     }
 
@@ -610,7 +606,6 @@ impl TokenProvider {
     }
 
     pub fn notice_token_file(&self) -> bool {
-        let _before_lock = observe_file(&self.dir);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let seen = observe_file(&self.dir);
         if st.file_seen == FileSeen::Unknown {
@@ -665,11 +660,7 @@ impl TokenProvider {
                         match store::delete_if_unchanged(&self.dir, &base) {
                             Ok(true) => {
                                 f.token_deleted = true;
-                                st.cached = None;
-                                st.live_scope = None;
-                                st.live_grant = None;
-                                st.obtained_at = None;
-                                st.file_seen = observe_file(&self.dir);
+                                self.reset_state_for_file(&mut st, observe_file(&self.dir));
                                 logger::warn(
                                     "deleted token.json: Microsoft says this token can never be used again",
                                     &[("code", serde_json::json!(f.code_label()))],

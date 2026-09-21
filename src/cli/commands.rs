@@ -14,8 +14,8 @@ use crate::auth::entra::EntraClient;
 use crate::auth::store::{self, SaveMode, TokenFile};
 use crate::auth::{
     AuthError, Grant, REVOKE_CONSENT_PATHS, TokenProvider, TokenSuccess, audit_scope,
-    effective_scope, forbidden_scope_message, grant_from_scope, scope_short_names,
-    stored_forbidden_scope_message, vet_grant,
+    effective_scope, forbidden_scope_message, grant_from_scope, keeps_serving_without_token,
+    scope_short_names, stored_forbidden_scope_message, vet_grant,
 };
 use crate::clock::SystemClock;
 use crate::config::{Config, Need, ScopeChoice, load_config, validate_data_dir};
@@ -197,40 +197,22 @@ pub fn serve() -> Result<i32, AppError> {
             if let AuthError::Entra(f) = &e {
                 logger::error(&f.render(), &[]);
             }
-            match &e {
-                AuthError::NotLoggedIn if cfg.start_without_token => {
-                    let app: AppError = e.into();
-                    logger::error(&app.message(), &[("code", json!(app.code()))]);
-                    logger::warn(
-                        &format!(
-                            "serving without a Microsoft sign-in (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls answer auth_required until a login lands; {LOGIN_HINT}"
-                        ),
-                        &[],
-                    );
-                    None
-                }
-                AuthError::Transport(_) if cfg.start_without_token => {
-                    let app: AppError = e.into();
-                    logger::error(&app.message(), &[("code", json!(app.code()))]);
-                    logger::warn(
-                        "serving while Entra is unreachable (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls fail with the transport error until Entra answers; the next tool call retries",
-                        &[],
-                    );
-                    None
-                }
-                AuthError::Entra(_) if cfg.start_without_token => {
-                    let app: AppError = e.into();
-                    logger::error(&app.message(), &[("code", json!(app.code()))]);
-                    logger::warn(
-                        &format!(
-                            "serving although Microsoft refused the sign-in (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls answer auth_failed (auth_required once a dead refresh token has been deleted) until a login lands or the app registration is fixed; {LOGIN_HINT}"
-                        ),
-                        &[],
-                    );
-                    None
-                }
-                _ => return Err(e.into()),
+            if !cfg.start_without_token || !keeps_serving_without_token(&e) {
+                return Err(e.into());
             }
+            let warning = match &e {
+                AuthError::NotLoggedIn => format!(
+                    "serving without a Microsoft sign-in (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls answer auth_required until a login lands; {LOGIN_HINT}"
+                ),
+                AuthError::Transport(_) => "serving while Entra is unreachable (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls fail with the transport error until Entra answers; the next tool call retries".to_string(),
+                _ => format!(
+                    "serving although Microsoft refused the sign-in (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls answer auth_failed (auth_required once a dead refresh token has been deleted) until a login lands or the app registration is fixed; {LOGIN_HINT}"
+                ),
+            };
+            let app: AppError = e.into();
+            logger::error(&app.message(), &[("code", json!(app.code()))]);
+            logger::warn(&warning, &[]);
+            None
         }
     };
     let signed_in = boot.is_some();
