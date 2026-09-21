@@ -1,9 +1,10 @@
 //! Shutdown against real processes and real signals (m7 §2, §10).
 //!
-//! `serve` cannot reach its listener offline: the boot refresh needs a live
-//! Entra (https-only, a fixed authority host, and the access token is never
-//! persisted), and a release-shaped binary has no fixture seam. So two kinds of
-//! subprocess, both started with `env_clear()`:
+//! Except in start-without-token mode, `serve` cannot reach its listener
+//! offline: the boot refresh needs a live Entra (https-only, a fixed authority
+//! host, and the access token is never persisted), and a release-shaped binary
+//! has no fixture seam. So two kinds of subprocess, both started with
+//! `env_clear()`:
 //!
 //! - the real binary, parked inside the boot refresh by this test's own flock
 //!   on `.token.lock`, which proves the handlers exist during the refresh;
@@ -17,9 +18,10 @@
 //! moved `Shutdown::install()` below them but still above `access_token()` would
 //! pass here.
 //!
-//! No token.json is ever written, so nothing here can reach the network even if
-//! a synchronisation assumption breaks: the default `serve` path exits 3, while
-//! the opt-in test below proves the listener stays up without one.
+//! No token.json is ever written in the offline cases, so nothing there can
+//! reach the network even if a synchronisation assumption breaks: the default
+//! `serve` path exits 3, while the opt-in test proves the listener stays up
+//! without one.
 //!
 //! Never call `Shutdown::install()` in a normal test: outside the re-executed
 //! child it would make Ctrl-C `_exit(0)` the test runner.
@@ -281,6 +283,37 @@ fn serve_without_a_token_stays_up_and_serves_healthz_when_opted_in() {
         assert!(!dir.join("token.json").exists(), "{scope}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[test]
+fn start_without_token_does_not_swallow_a_corrupt_token_store() {
+    let dir = std::env::temp_dir().join(format!(
+        "todo-mcp-start-without-token-corrupt-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .expect("data dir");
+    std::fs::write(dir.join("token.json"), "{}").expect("corrupt token");
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_todo-mcp"));
+    cmd.env_clear()
+        .arg("serve")
+        .env("TODO_MCP_CLIENT_ID", "00000000-0000-0000-0000-000000000000")
+        .env("TODO_MCP_DATA_DIR", &dir)
+        .env("TODO_MCP_BIND", "127.0.0.1:0")
+        .env("TODO_MCP_TZ", "UTC")
+        .env("TODO_MCP_START_WITHOUT_TOKEN", "1");
+    let mut p = Proc::spawn(cmd);
+    let status = p.exit_within(STARTUP);
+    assert_ne!(status.code(), Some(0), "{status:?}");
+    assert_ne!(status.code(), Some(3), "{status:?}");
+    let log = p.log();
+    assert!(has(&log, "Token store unusable"), "{log:#?}");
+    assert!(dir.join("token.json").exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

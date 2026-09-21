@@ -67,7 +67,7 @@ EXIT CODES:
     0    success; doctor found nothing; healthcheck healthy
     1    error; doctor reported a finding; healthcheck unhealthy
     2    usage error or invalid configuration
-    3    not signed in (serve found no token.json)
+    3    not signed in (serve found no token.json; the opt-in start-without-token mode keeps it up)
     130  a one-shot command interrupted by Ctrl-C (143 on SIGTERM); serve exits 0
 
 Configuration is by environment variable; see the Configuration section of

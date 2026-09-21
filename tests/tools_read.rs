@@ -56,7 +56,7 @@ fn an_unsigned_server_recovers_on_the_first_call_after_login() {
     write_token_file(&h.dir, "RT-OLD", RW_SCOPE);
     let lists = h.call("todo_lists", json!({}));
     assert!(lists.get("isError").is_none(), "{lists}");
-    assert_eq!(h.state.effective_grant(), Grant::ReadWrite);
+    assert_eq!(h.state.effective_grant(), Some(Grant::ReadWrite));
     let status = h.call("todo_account_status", json!({}));
     assert_eq!(
         status["structuredContent"]["grant"], "Tasks.ReadWrite",
@@ -81,6 +81,64 @@ fn an_unsigned_server_refuses_writes_after_a_narrower_grant_lands() {
         text.contains("current Microsoft Graph grant is `Tasks.Read`"),
         "{text}"
     );
+}
+
+#[test]
+fn an_unsigned_read_ceiling_has_five_tools_and_refuses_writes_as_read_only() {
+    let h = harness_unsigned(&[("TODO_MCP_SCOPE", "Tasks.Read")], READ_SCOPE);
+    assert_eq!(h.state.list_tools().as_array().unwrap().len(), 5);
+
+    let write = h.call("todo_create_tasks", json!({"tasks": [{"title": "x"}]}));
+    assert_eq!(write["isError"], true, "{write}");
+    let text = write["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("TODO_MCP_SCOPE=Tasks.Read"), "{text}");
+    assert_eq!(h.graph_requests(), 0);
+
+    let lists = h.call("todo_lists", json!({}));
+    assert_eq!(lists["isError"], true, "{lists}");
+    assert!(
+        lists["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("auth_required"),
+        "{lists}"
+    );
+}
+
+#[test]
+fn an_unsigned_server_follows_a_widened_grant_without_restart() {
+    let h = harness_unsigned(&[], READ_SCOPE);
+    write_token_file(&h.dir, "RT-OLD", RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+
+    let first = h.call("todo_lists", json!({}));
+    assert!(first.get("isError").is_none(), "{first}");
+    assert_eq!(h.state.effective_grant(), Some(Grant::ReadOnly));
+
+    *h.endpoint.scope.lock().unwrap() = Some(RW_SCOPE.to_string());
+    write_token_file(&h.dir, "RT-NEW", RW_SCOPE);
+    h.clock.set(pinned_now() + Duration::seconds(3600));
+    let status = h.call("todo_account_status", json!({"check_connectivity": true}));
+    assert_eq!(
+        status["structuredContent"]["restart_required"], false,
+        "{status}"
+    );
+    assert_eq!(
+        status["structuredContent"]["grant"], "Tasks.ReadWrite",
+        "{status}"
+    );
+
+    let write = h.call(
+        "todo_create_tasks",
+        json!({"list": "Tasks", "tasks": [{"title": "x"}]}),
+    );
+    assert!(write.get("isError").is_none(), "{write}");
+}
+
+#[test]
+fn harness_booted_readwrite_scope_builds_all_ten_tools() {
+    let h = harness_booted(&[], RW_SCOPE);
+    assert_eq!(h.state.list_tools().as_array().unwrap().len(), 10);
 }
 
 #[test]

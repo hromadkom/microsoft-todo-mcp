@@ -803,24 +803,12 @@ pub fn harness_booted(extra: &[(&str, &str)], granted_scope: &str) -> Harness {
 }
 
 fn build_harness(extra: &[(&str, &str)], endpoint_scope: &str, grant: Option<Grant>) -> Harness {
-    build_harness_inner(
-        extra,
-        endpoint_scope,
-        grant,
-        true,
-        grant.unwrap_or(Grant::None),
-    )
+    build_harness_inner(extra, endpoint_scope, grant, true, false)
 }
 
 /// Build the opt-in startup state before a token has landed on disk.
 pub fn harness_unsigned(extra: &[(&str, &str)], endpoint_scope: &str) -> Harness {
-    build_harness_inner(
-        extra,
-        endpoint_scope,
-        Some(Grant::None),
-        false,
-        Grant::ReadWrite,
-    )
+    build_harness_inner(extra, endpoint_scope, None, false, true)
 }
 
 fn build_harness_inner(
@@ -828,7 +816,7 @@ fn build_harness_inner(
     endpoint_scope: &str,
     grant: Option<Grant>,
     write_token: bool,
-    tools_grant: Grant,
+    unsigned: bool,
 ) -> Harness {
     let fx = Fixture::start();
     let dir = temp_dir("harness");
@@ -853,11 +841,16 @@ fn build_harness_inner(
         &requested,
         clock.clone(),
     ));
-    let grant = match grant {
-        Some(g) => g,
-        None => {
-            tokens.access_token().expect("boot refresh");
-            tokens.initial_grant().expect("grant after boot")
+    let boot_grant = if unsigned {
+        tokens.follow_live_grant();
+        None
+    } else {
+        match grant {
+            Some(g) => Some(g),
+            None => {
+                tokens.access_token().expect("boot refresh");
+                Some(tokens.initial_grant().expect("grant after boot"))
+            }
         }
     };
     let sleeps = Arc::new(Mutex::new(Vec::new()));
@@ -882,13 +875,7 @@ fn build_harness_inner(
             blocked = cv.wait(blocked).unwrap();
         }
     });
-    let state = Arc::new(ServerState::with_tools_grant(
-        cfg,
-        graph,
-        clock.clone(),
-        grant,
-        tools_grant,
-    ));
+    let state = Arc::new(ServerState::new(cfg, graph, clock.clone(), boot_grant));
     Harness {
         fx,
         state,

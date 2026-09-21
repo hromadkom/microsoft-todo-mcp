@@ -15,6 +15,7 @@ pub mod store;
 
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -274,6 +275,23 @@ pub enum Grant {
     None,
 }
 
+fn grant_to_atomic(grant: Grant) -> u8 {
+    match grant {
+        Grant::ReadWrite => 1,
+        Grant::ReadOnly => 2,
+        Grant::None => 3,
+    }
+}
+
+fn grant_from_atomic(value: u8) -> Option<Grant> {
+    match value {
+        1 => Some(Grant::ReadWrite),
+        2 => Some(Grant::ReadOnly),
+        3 => Some(Grant::None),
+        _ => None,
+    }
+}
+
 impl Grant {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -451,7 +469,9 @@ struct Cached {
 #[derive(Default)]
 struct ProviderState {
     cached: Option<Cached>,
-    /// The grant the tool list was built from — frozen for the process.
+    /// The grant the tool list was built from in default mode. In
+    /// start-without-token mode the list is the TODO_MCP_SCOPE ceiling and
+    /// dispatch follows the live grant.
     initial_grant: Option<Grant>,
     /// The grant observed on the most recent refresh.
     live_grant: Option<Grant>,
@@ -471,6 +491,8 @@ pub struct TokenProvider {
     requested_scope: String,
     clock: Arc<dyn Clock>,
     state: Mutex<ProviderState>,
+    live_grant_atomic: AtomicU8,
+    follow_live_grant: AtomicBool,
 }
 
 /// A snapshot for `doctor` / `todo_account_status`. No token material.
@@ -503,6 +525,8 @@ impl TokenProvider {
             requested_scope: requested_scope.to_string(),
             clock,
             state: Mutex::new(ProviderState::default()),
+            live_grant_atomic: AtomicU8::new(0),
+            follow_live_grant: AtomicBool::new(false),
         }
     }
 
@@ -596,11 +620,20 @@ impl TokenProvider {
                     });
                     st.refreshes += 1;
                     st.obtained_at = Some(new_file.obtained_at.clone());
+                    let first_refresh = st.initial_grant.is_none();
+                    let follow_live_grant = self.follow_live_grant.load(Ordering::Acquire);
+                    let extra_scope_warning = if first_refresh && follow_live_grant {
+                        audit_scope(&granted, &self.requested_scope).warning()
+                    } else {
+                        None
+                    };
                     st.live_scope = Some(granted);
                     st.live_grant = Some(grant);
-                    if st.initial_grant.is_none() {
+                    self.live_grant_atomic
+                        .store(grant_to_atomic(grant), Ordering::Release);
+                    if first_refresh {
                         st.initial_grant = Some(grant);
-                    } else if st.initial_grant != Some(grant) {
+                    } else if !follow_live_grant && st.initial_grant != Some(grant) {
                         logger::warn(
                             "granted scope changed since startup; the tool list is frozen until restart",
                             &[
@@ -612,7 +645,12 @@ impl TokenProvider {
                             ],
                         );
                     }
-                    return Ok(success.access_token.clone());
+                    let access_token = success.access_token.clone();
+                    drop(st);
+                    if let Some(w) = extra_scope_warning {
+                        logger::warn(&w, &[]);
+                    }
+                    return Ok(access_token);
                 }
                 SaveOutcome::Adopted(disk) => {
                     // A `login` landed while we were on the network. Discard our
@@ -638,13 +676,16 @@ impl TokenProvider {
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let initial = st.initial_grant.unwrap_or(Grant::None);
         let live = st.live_grant.unwrap_or(initial);
-        let restart_reason = (st.initial_grant.is_some() && live != initial).then(|| {
-            format!(
-                "granted scope changed from {} to {} after startup",
-                initial.as_str(),
-                live.as_str()
-            )
-        });
+        let restart_reason = (!self.follow_live_grant.load(Ordering::Acquire)
+            && st.initial_grant.is_some()
+            && live != initial)
+            .then(|| {
+                format!(
+                    "granted scope changed from {} to {} after startup",
+                    initial.as_str(),
+                    live.as_str()
+                )
+            });
         TokenStatus {
             initial_grant: initial,
             live_grant: live,
@@ -656,12 +697,23 @@ impl TokenProvider {
         }
     }
 
-    /// The grant the tool list is built from. `None` before the first refresh.
+    /// The grant the tool list was built from in default mode; in
+    /// start-without-token mode the list is the TODO_MCP_SCOPE ceiling and
+    /// dispatch follows the live grant.
     pub fn initial_grant(&self) -> Option<Grant> {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .initial_grant
+    }
+
+    /// The most recent successful refresh, read without taking the state lock.
+    pub fn live_grant(&self) -> Option<Grant> {
+        grant_from_atomic(self.live_grant_atomic.load(Ordering::Acquire))
+    }
+
+    pub fn follow_live_grant(&self) {
+        self.follow_live_grant.store(true, Ordering::Release);
     }
 }
 

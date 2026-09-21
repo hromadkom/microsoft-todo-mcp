@@ -14,7 +14,7 @@ use std::time::Instant;
 use chrono_tz::Tz;
 use serde_json::{Value, json};
 
-use crate::auth::Grant;
+use crate::auth::{Grant, grant_from_scope};
 use crate::cache::{Cache, truncate_bodies};
 use crate::clock::Clock;
 use crate::config::Config;
@@ -39,7 +39,7 @@ pub struct ServerState {
     /// Frozen at construction from the granted scope, or configured ceiling
     /// when serving without a sign-in.
     pub tools: Value,
-    pub grant: Grant,
+    boot_grant: Option<Grant>,
     pub started: Instant,
     /// The effective zone (config or UTC).
     pub tz: Tz,
@@ -129,18 +129,14 @@ pub struct SyncOutcome {
 type Known = HashMap<String, (Vec<Task>, bool)>;
 
 impl ServerState {
-    pub fn new(cfg: Config, graph: GraphClient, clock: Arc<dyn Clock>, grant: Grant) -> Self {
-        Self::with_tools_grant(cfg, graph, clock, grant, grant)
-    }
-
-    pub fn with_tools_grant(
+    pub fn new(
         cfg: Config,
         graph: GraphClient,
         clock: Arc<dyn Clock>,
-        grant: Grant,
-        tools_grant: Grant,
+        boot_grant: Option<Grant>,
     ) -> Self {
         let tz = cfg.effective_tz();
+        let tools_grant = boot_grant.unwrap_or_else(|| grant_from_scope(&cfg.scope.requested()));
         let tools = tools::build_tools(tools_grant, tz.name());
         let cache = Cache::new(cfg.cache_ttl_seconds, cfg.cache_max_tasks);
         Self {
@@ -150,7 +146,7 @@ impl ServerState {
             cache: RwLock::new(cache),
             refill: Mutex::new(()),
             tools,
-            grant,
+            boot_grant,
             started: Instant::now(),
             tz,
             warned_tzids: Mutex::new(HashSet::new()),
@@ -158,13 +154,9 @@ impl ServerState {
     }
 
     /// The grant tool dispatch acts on: the boot grant, or — when `serve`
-    /// started without a sign-in — the grant of the first refresh that has
-    /// succeeded since.
-    pub fn effective_grant(&self) -> Grant {
-        if self.grant != Grant::None {
-            return self.grant;
-        }
-        self.graph.tokens().initial_grant().unwrap_or(Grant::None)
+    /// started without a sign-in — the latest successfully refreshed grant.
+    pub fn effective_grant(&self) -> Option<Grant> {
+        self.boot_grant.or_else(|| self.graph.tokens().live_grant())
     }
 
     /// The cache lock RESETS on poison instead of absorbing it (m4 §1.2).

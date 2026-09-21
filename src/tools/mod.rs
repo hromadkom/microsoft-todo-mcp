@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::auth::Grant;
 use crate::config::{ScopeChoice, is_valid_iana};
-use crate::errors::{LOGIN_HINT, RESTART_HINT};
+use crate::errors::{AppError, LOGIN_HINT, RESTART_HINT};
 use crate::mcp::RpcError;
 use crate::server::ServerState;
 
@@ -36,7 +36,7 @@ pub const WRITE_TOOLS: [&str; 5] = [
 ];
 
 /// `tools/list` for a grant: 10 under `ReadWrite`, 5 otherwise. Computed once
-/// at construction and frozen (m6 §7); startup without a token passes the
+/// at construction and frozen (m6 §7); startup without a token uses the
 /// configured scope ceiling here.
 pub fn build_tools(grant: Grant, tz: &str) -> Value {
     let all = schema::all(tz);
@@ -54,23 +54,33 @@ pub fn dispatch(state: &ServerState, name: &str, args: &Value) -> Result<Value, 
     if !args.is_object() {
         return Ok(render::error("arguments must be a JSON object".into()));
     }
-    let grant = state.effective_grant();
-    if WRITE_TOOLS.contains(&name)
-        && grant != Grant::ReadWrite
-        && (grant != Grant::None || state.cfg.scope == ScopeChoice::Read)
-    {
-        // Under a Read config the grant is capped at Tasks.Read (auth::vet_grant),
-        // so "re-run login and restart" would change nothing.
-        let text = if state.cfg.scope == ScopeChoice::Read {
-            "Refused: this server is configured read-only (TODO_MCP_SCOPE=Tasks.Read), so write tools are not available and restarting will not change that. To enable them the operator sets TODO_MCP_SCOPE=Tasks.ReadWrite, runs login again, then restarts the server.".to_string()
-        } else {
-            format!(
-                "Refused: the current Microsoft Graph grant is `{}`. Write tools require Tasks.ReadWrite. To enable them, {LOGIN_HINT}. {RESTART_HINT}.",
-                grant.as_str()
-            )
-        };
-        return Ok(render::error(text));
+    let mut grant = state.effective_grant();
+    if WRITE_TOOLS.contains(&name) && grant.is_none() && state.cfg.scope != ScopeChoice::Read {
+        match state.graph.tokens().access_token() {
+            Ok(_) => grant = state.effective_grant(),
+            Err(e) => return Ok(render::failure(&AppError::from_auth(&e), state)),
+        }
     }
+    match grant {
+        Some(g) if WRITE_TOOLS.contains(&name) && g != Grant::ReadWrite => {
+            // Under a Read config the grant is capped at Tasks.Read (auth::vet_grant),
+            // so "re-run login and restart" would change nothing.
+            let text = if state.cfg.scope == ScopeChoice::Read {
+                "Refused: this server is configured read-only (TODO_MCP_SCOPE=Tasks.Read), so write tools are not available and restarting will not change that. To enable them the operator sets TODO_MCP_SCOPE=Tasks.ReadWrite, runs login again, then restarts the server.".to_string()
+            } else {
+                format!(
+                    "Refused: the current Microsoft Graph grant is `{}`. Write tools require Tasks.ReadWrite. To enable them, {LOGIN_HINT}. {RESTART_HINT}.",
+                    g.as_str()
+                )
+            };
+            return Ok(render::error(text));
+        }
+        None if WRITE_TOOLS.contains(&name) && state.cfg.scope == ScopeChoice::Read => {
+            let text = "Refused: this server is configured read-only (TODO_MCP_SCOPE=Tasks.Read), so write tools are not available and restarting will not change that. To enable them the operator sets TODO_MCP_SCOPE=Tasks.ReadWrite, runs login again, then restarts the server.".to_string();
+            return Ok(render::error(text));
+        }
+        _ => {}
+    };
     let result = match name {
         "todo_lists" => read::todo_lists(state, args),
         "todo_search_tasks" => read::todo_search_tasks(state, args),

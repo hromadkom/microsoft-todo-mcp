@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use common::{Harness, Override, harness, harness_with_grant, seed_22_lists};
+use common::{
+    Harness, Override, harness, harness_unsigned, harness_with_grant, seed_22_lists,
+    write_token_file,
+};
 use microsoft_todo_mcp::auth::Grant;
 use microsoft_todo_mcp::errors::{LOGIN_HINT, RESTART_HINT};
 use microsoft_todo_mcp::mcp::ToolProvider;
@@ -60,6 +63,27 @@ fn a_write_under_a_read_config_names_the_setting_not_a_restart() {
     assert!(text.contains(LOGIN_HINT), "{text}");
     assert!(text.contains(RESTART_HINT), "{text}");
     assert_eq!(h.graph_requests(), 0);
+}
+
+#[test]
+fn first_write_after_a_readonly_login_refuses_before_graph() {
+    let h = harness_unsigned(&[], "https://graph.microsoft.com/Tasks.Read offline_access");
+    write_token_file(
+        &h.dir,
+        "RT-OLD",
+        "https://graph.microsoft.com/Tasks.ReadWrite offline_access",
+    );
+    let r = h.call("todo_create_tasks", json!({ "tasks": [{ "title": "x" }] }));
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("current Microsoft Graph grant is `Tasks.Read`"),
+        "{r}"
+    );
+    assert_eq!(h.graph_requests(), 0);
+    assert_eq!(h.fx.count_matching("POST", "/tasks"), 0);
 }
 
 #[test]

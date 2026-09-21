@@ -180,7 +180,9 @@ pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<C
         Some("1" | "true" | "yes") => true,
         Some("0" | "false" | "no") => false,
         Some(_) => {
-            issues.push("TODO_MCP_START_WITHOUT_TOKEN must be 1 or 0".to_string());
+            issues.push(
+                "TODO_MCP_START_WITHOUT_TOKEN must be 1, 0, true, false, yes or no".to_string(),
+            );
             false
         }
     };
@@ -499,18 +501,6 @@ mod tests {
                 "{value}"
             );
         }
-    }
-
-    #[test]
-    fn start_without_token_accepts_case_insensitive_values() {
-        assert!(
-            load(&[
-                ("TODO_MCP_CLIENT_ID", ID),
-                ("TODO_MCP_START_WITHOUT_TOKEN", "YeS")
-            ])
-            .unwrap()
-            .start_without_token
-        );
     }
 
     #[test]

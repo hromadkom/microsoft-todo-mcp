@@ -924,13 +924,14 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
     };
     // Read the token status AFTER the probe so a first refresh is reflected.
     let ts = state.graph.tokens().status();
+    let eff = state.effective_grant();
     let live = if ts.live_scope.is_some() {
         ts.live_grant
     } else {
-        state.effective_grant()
+        eff.unwrap_or(Grant::None)
     };
     let restart_reason = ts.restart_reason.clone();
-    let write_enabled = state.effective_grant() == Grant::ReadWrite;
+    let write_enabled = eff == Some(Grant::ReadWrite);
     let widened = !write_enabled && live == Grant::ReadWrite;
     let stats = state.cache_read().stats(std::time::Instant::now());
     let gs = state.graph.stats();
