@@ -310,9 +310,17 @@ fn a_widening_asks_for_a_restart_only_when_the_configured_scope_allows_writes() 
             assert_eq!(st.live_grant, Grant::ReadWrite, "{st:?}");
         }
         if expect_restart {
-            assert_ne!(p.live_grant(), p.initial_grant(), "{configured}");
+            assert_ne!(
+                p.status().live_grant,
+                p.initial_grant().unwrap(),
+                "{configured}"
+            );
         } else {
-            assert_eq!(p.live_grant(), p.initial_grant(), "{configured}");
+            assert_eq!(
+                p.status().live_grant,
+                p.initial_grant().unwrap(),
+                "{configured}"
+            );
         }
     }
 }
@@ -326,20 +334,61 @@ fn refresh_failures_back_off_until_login_or_clock_expiry() {
     let clock = Arc::new(FixedClock::at(pinned_now()));
     let p = provider_with_clock(&dir, endpoint.clone(), CLIENT_ID, SCOPE, clock.clone());
 
-    assert!(matches!(p.access_token(), Err(AuthError::Transport(_))));
-    assert!(matches!(p.access_token(), Err(AuthError::Transport(_))));
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
     assert_eq!(endpoint.calls(), 1);
 
     let mut replacement = store::load(&dir).unwrap();
     replacement.refresh_token = Secret::new("RT-NEW");
     replacement.obtained_at = "2026-08-25T13:50:00.000000Z".into();
     store::save_atomic(&dir, &replacement, None, SaveMode::Login).unwrap();
-    assert!(matches!(p.access_token(), Err(AuthError::Transport(_))));
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
     assert_eq!(endpoint.calls(), 2);
 
     clock.set(pinned_now() + Duration::seconds(31));
-    assert!(matches!(p.access_token(), Err(AuthError::Transport(_))));
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
     assert_eq!(endpoint.calls(), 3);
+}
+
+#[test]
+fn a_failed_refresh_keeps_a_still_valid_cached_token_and_uses_post_request_backoff_time() {
+    let dir = temp_dir("refresh-backoff-valid");
+    write_token_file(&dir, "RT-OLD", SCOPE);
+    let endpoint = Arc::new(StubEndpoint::new(SCOPE));
+    let clock = Arc::new(FixedClock::at(pinned_now()));
+    let p = provider_with_clock(&dir, endpoint.clone(), CLIENT_ID, SCOPE, clock.clone());
+    let first = p.access_token().expect("initial token");
+    assert_eq!(endpoint.calls(), 1);
+    *endpoint.fail_with.lock().unwrap() = Some("offline".into());
+    clock.set(pinned_now() + Duration::seconds(3590));
+    assert!(p.access_token().is_ok());
+    assert_eq!(endpoint.calls(), 2);
+    clock.set(pinned_now() + Duration::seconds(3595));
+    assert!(p.access_token().is_ok());
+    assert_eq!(endpoint.calls(), 2);
+
+    let callback_clock = clock.clone();
+    *endpoint.on_call.lock().unwrap() = Some(Box::new(move || {
+        let now = *callback_clock.0.lock().unwrap();
+        callback_clock.set(now + Duration::seconds(20));
+    }));
+    clock.set(pinned_now() + Duration::seconds(3621));
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
+    assert_eq!(endpoint.calls(), 3);
+    clock.set(pinned_now() + Duration::seconds(3646));
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
+    assert_eq!(endpoint.calls(), 3);
+    clock.set(pinned_now() + Duration::seconds(3672));
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
+    assert_eq!(endpoint.calls(), 4);
+    let _ = first;
 }
 
 fn token_success(scope: &str, refresh_token: Option<&str>) -> TokenSuccess {

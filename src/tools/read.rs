@@ -913,9 +913,6 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
         Ok(v) => v.unwrap_or(false),
         Err(e) => return invalid_args("todo_account_status", &e),
     };
-    if state.boot_grant().is_none() {
-        let _ = state.graph.tokens().access_token_after_login();
-    }
     let connectivity = if check {
         let mut budget = state.budget();
         match state.graph.get_json(&lists_probe_url(), &mut budget) {
@@ -925,11 +922,12 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
     } else {
         json!({ "checked": false, "ok": Value::Null, "detail": Value::Null })
     };
-    // Read the token status after the optional refresh so a later login is reflected.
     let ts = state.graph.tokens().status();
-    let eff = state
-        .boot_grant()
-        .or_else(|| ts.live_scope.is_some().then_some(ts.live_grant));
+    let eff = if state.follows_logins() {
+        ts.live_scope.is_some().then_some(ts.live_grant)
+    } else {
+        state.boot_grant()
+    };
     let live = if ts.live_scope.is_some() {
         ts.live_grant
     } else {

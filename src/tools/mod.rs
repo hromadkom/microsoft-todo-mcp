@@ -53,51 +53,44 @@ pub fn build_tools(grant: Grant, tz: &str) -> Value {
 }
 
 fn narrow_grant_refusal(grant: Grant, frozen: bool) -> String {
-    if frozen {
-        format!(
-            "Refused: the current Microsoft Graph grant is `{}`. Write tools require Tasks.ReadWrite. To enable them, {LOGIN_HINT}. {RESTART_HINT}.",
-            grant.as_str()
-        )
-    } else {
-        format!(
-            "Refused: the current Microsoft Graph grant is `{}`. Write tools require Tasks.ReadWrite. To enable them, {LOGIN_HINT}; the next write call picks the new grant up without a restart.",
-            grant.as_str()
-        )
-    }
+    let _ = frozen;
+    format!(
+        "Refused: the current Microsoft Graph grant is `{}`. Write tools require Tasks.ReadWrite. To enable them, {LOGIN_HINT}. {RESTART_HINT}.",
+        grant.as_str()
+    )
 }
 
 pub fn dispatch(state: &ServerState, name: &str, args: &Value) -> Result<Value, RpcError> {
+    state.observe_token();
     if !args.is_object() {
+        state.observe_token();
         return Ok(render::error("arguments must be a JSON object".into()));
     }
     let is_write = WRITE_TOOLS.contains(&name);
     if is_write && state.cfg.scope == ScopeChoice::Read {
         // Under a Read config the grant is capped at Tasks.Read (auth::vet_grant),
         // so another login cannot enable write tools without changing config.
+        state.observe_token();
         return Ok(render::error(READ_ONLY_REFUSAL.into()));
     }
     if is_write {
-        let grant = match state.boot_grant() {
-            Some(g) => Some(g),
-            None => match state.graph.tokens().access_token_after_login() {
-                Ok(_) => state.graph.tokens().live_grant(),
-                Err(e) => return Ok(render::failure(&AppError::from_auth(&e), state)),
-            },
+        let grant = if state.follows_logins() {
+            match state.graph.tokens().access_token_with_grant() {
+                Ok((_, g)) => g,
+                Err(e) => {
+                    state.observe_token();
+                    return Ok(render::failure(&AppError::from_auth(&e), state));
+                }
+            }
+        } else {
+            state.boot_grant().unwrap_or(Grant::None)
         };
-        match grant {
-            Some(Grant::ReadWrite) => {}
-            Some(g) => {
-                return Ok(render::error(narrow_grant_refusal(
-                    g,
-                    state.boot_grant().is_some(),
-                )));
-            }
-            None => {
-                return Ok(render::error(narrow_grant_refusal(
-                    Grant::None,
-                    state.boot_grant().is_some(),
-                )));
-            }
+        if grant != Grant::ReadWrite {
+            state.observe_token();
+            return Ok(render::error(narrow_grant_refusal(
+                grant,
+                !state.follows_logins(),
+            )));
         }
     }
     let result = match name {
@@ -112,12 +105,14 @@ pub fn dispatch(state: &ServerState, name: &str, args: &Value) -> Result<Value, 
         "todo_delete_tasks" => write::todo_delete_tasks(state, args),
         "todo_manage_checklist" => write::todo_manage_checklist(state, args),
         _ => {
+            state.observe_token();
             return Err(RpcError {
                 code: -32602,
                 message: format!("Unknown tool: {name}"),
             });
         }
     };
+    state.observe_token();
     Ok(result)
 }
 

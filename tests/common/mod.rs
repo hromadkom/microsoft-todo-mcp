@@ -681,6 +681,7 @@ pub struct StubEndpoint {
     pub seen_rts: Mutex<Vec<String>>,
     pub barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     pub fail_with: Mutex<Option<String>>,
+    pub on_call: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl StubEndpoint {
@@ -691,6 +692,7 @@ impl StubEndpoint {
             seen_rts: Mutex::new(Vec::new()),
             barrier: Mutex::new(None),
             fail_with: Mutex::new(None),
+            on_call: Mutex::new(None),
         }
     }
 
@@ -705,6 +707,9 @@ impl TokenEndpoint for StubEndpoint {
         self.seen_rts.lock().unwrap().push(rt.to_string());
         if let Some(b) = self.barrier.lock().unwrap().clone() {
             b.wait();
+        }
+        if let Some(f) = self.on_call.lock().unwrap().as_ref() {
+            f();
         }
         if let Some(msg) = self.fail_with.lock().unwrap().clone() {
             return Err(AuthError::Transport(msg));
@@ -821,7 +826,15 @@ pub fn harness_unsigned(extra: &[(&str, &str)], endpoint_scope: &str) -> Harness
 fn build_harness_inner(extra: &[(&str, &str)], endpoint_scope: &str, boot: Boot) -> Harness {
     let fx = Fixture::start();
     let dir = temp_dir("harness");
-    let cfg = config(&dir, extra);
+    let mut config_extra = extra.to_vec();
+    if matches!(boot, Boot::Unsigned | Boot::FollowSigned)
+        && !config_extra
+            .iter()
+            .any(|(name, _)| *name == "TODO_MCP_START_WITHOUT_TOKEN")
+    {
+        config_extra.push(("TODO_MCP_START_WITHOUT_TOKEN", "1"));
+    }
+    let cfg = config(&dir, &config_extra);
     let requested = cfg.scope.requested();
     if !matches!(boot, Boot::Unsigned) {
         write_token_file(&dir, "RT-OLD", &requested);

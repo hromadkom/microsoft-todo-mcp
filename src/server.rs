@@ -14,12 +14,12 @@ use std::time::Instant;
 use chrono_tz::Tz;
 use serde_json::{Value, json};
 
-use crate::auth::Grant;
+use crate::auth::{Grant, audit_scope};
 use crate::cache::{Cache, truncate_bodies};
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::domain::resolve::{Resolution, resolve_list};
-use crate::errors::AppError;
+use crate::errors::{AppError, RESTART_HINT};
 use crate::graph::batch::BatchSub;
 use crate::graph::client::GraphClient;
 use crate::graph::models::{Task, TaskList};
@@ -40,6 +40,8 @@ pub struct ServerState {
     /// when serving without a sign-in.
     pub tools: Value,
     boot_grant: Option<Grant>,
+    last_grant: Mutex<Option<Grant>>,
+    last_scope: Mutex<Option<String>>,
     pub started: Instant,
     /// The effective zone (config or UTC).
     pub tz: Tz,
@@ -139,6 +141,10 @@ impl ServerState {
         let tools_grant = boot_grant.unwrap_or_else(|| Grant::ceiling(cfg.scope));
         let tools = tools::build_tools(tools_grant, tz.name());
         let cache = Cache::new(cfg.cache_ttl_seconds, cfg.cache_max_tasks);
+        debug_assert_eq!(boot_grant.is_none(), cfg.start_without_token);
+        let ts = graph.tokens().status();
+        let last_grant = ts.live_scope.is_some().then_some(ts.live_grant);
+        let last_scope = ts.live_scope;
         Self {
             cfg,
             graph,
@@ -147,24 +153,20 @@ impl ServerState {
             refill: Mutex::new(()),
             tools,
             boot_grant,
+            last_grant: Mutex::new(last_grant),
+            last_scope: Mutex::new(last_scope),
             started: Instant::now(),
             tz,
             warned_tzids: Mutex::new(HashSet::new()),
         }
     }
 
-    /// The grant tool dispatch acts on: the boot grant, or — when `serve`
-    /// started without a sign-in — the latest successfully refreshed grant.
-    pub fn effective_grant(&self) -> Option<Grant> {
-        self.boot_grant.or_else(|| self.graph.tokens().live_grant())
-    }
-
     pub fn boot_grant(&self) -> Option<Grant> {
         self.boot_grant
     }
 
-    pub fn restart_reason(&self) -> Option<String> {
-        self.restart_reason_for(self.graph.tokens().live_grant())
+    pub fn follows_logins(&self) -> bool {
+        self.cfg.start_without_token
     }
 
     pub fn restart_reason_for(&self, live: Option<Grant>) -> Option<String> {
@@ -178,6 +180,50 @@ impl ServerState {
                 live.as_str()
             )
         })
+    }
+
+    pub fn observe_token(&self) {
+        if self.graph.tokens().notice_token_file() {
+            self.cache_write().reset_preserving_mailbox_id();
+            logger::info("token.json changed on disk; task cache reset", &[]);
+        }
+        let ts = self.graph.tokens().status();
+        let live = ts.live_scope.is_some().then_some(ts.live_grant);
+        {
+            let mut last = self.last_grant.lock().unwrap_or_else(|e| e.into_inner());
+            if live.is_some() && live != *last {
+                if self.follows_logins() {
+                    logger::info(
+                        "granted scope changed",
+                        &[
+                            ("was", json!(last.map(Grant::as_str))),
+                            ("now", json!(live.map(Grant::as_str))),
+                        ],
+                    );
+                } else if let (Some(boot), Some(now)) = (self.boot_grant, live)
+                    && boot != now
+                {
+                    logger::warn(
+                        &format!(
+                            "granted scope changed since startup; the tool list is frozen until restart. {RESTART_HINT}"
+                        ),
+                        &[("was", json!(boot.as_str())), ("now", json!(now.as_str()))],
+                    );
+                }
+                *last = live;
+            }
+        }
+        {
+            let mut last = self.last_scope.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(scope) = ts.live_scope.as_deref()
+                && *last != Some(scope.to_string())
+            {
+                if let Some(w) = audit_scope(scope, &self.cfg.scope.requested()).warning() {
+                    logger::warn(&w, &[]);
+                }
+                *last = Some(scope.to_string());
+            }
+        }
     }
 
     /// The cache lock RESETS on poison instead of absorbing it (m4 §1.2).

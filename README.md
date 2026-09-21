@@ -16,7 +16,7 @@ nothing else.
 >
 > | | |
 > |---|---|
-> | **Test suite** | 208 tests (113 unit, 95 integration) against a hand-rolled fixture Entra/Graph server. Green under the host time zone and under `TZ=Pacific/Kiritimati`, and inside `docker build --target test .` |
+> | **Test suite** | 213 tests (113 unit, 100 integration) against a hand-rolled fixture Entra/Graph server. Green under the host time zone and under `TZ=Pacific/Kiritimati`, and inside `docker build --target test .` |
 > | **Release image** | Built for `linux/amd64` and `linux/arm64` through the size gate, and checked on macOS arm64 Docker Desktop: user `65534:65534`, `/data` volume, healthcheck, no shell. A compose run with a fake client ID showed a fresh named volume's `/data` owned `65534:65534` mode `0700` (Docker Desktop keeps named volumes on ext4 inside its Linux VM; only bind mounts go through VirtioFS), and the `Restarting (3)` refusal without a sign-in |
 > | **Linux** | CI's `Release image` job asserts that first-mount ownership again on the amd64 image on a native Linux engine, and is the only evidence for `docker stop` during boot exiting 0 within 2 s (as PID 1, no init). Stopping a running server, and its drain, are tested on the host by `tests/shutdown.rs` |
 > | **Never done** | A run against a real Microsoft account. The live-Graph assumptions — `$batch` on `/me/todo/*`, whether `null` clears a due date, which Windows zone names a date write accepts, the exact scopes Microsoft grants — are still assumptions. [CHANGELOG.md](CHANGELOG.md) lists them all |
@@ -43,7 +43,7 @@ That is enforced structurally, not editorially:
 | One delegated scope | Requests exactly `Tasks.ReadWrite` (or `Tasks.Read`) + `offline_access`; `TODO_MCP_SCOPE` accepts nothing else. If the scope Microsoft reports back includes any `.All` permission, the token is refused: `login` exits 1 and saves nothing, `serve` will not start and any later refresh is refused, and `doctor` reports a finding. Any other Graph permission granted on top (typically the portal's default `User.Read`) is named in a warning and never used; `openid`, `profile`, `email` and `offline_access` are ignored. |
 | No cross-user access | The `/users/{id}/…` path shape **exists nowhere in the codebase**. Only `/me`. A build gate enforces it. |
 | No secret, no daemon identity | Public client, no client secret. `TODO_MCP_CLIENT_SECRET` being set is a startup refusal. |
-| Tool surface follows the *actual* grant, capped by your config | Write tools are registered only if the scope Microsoft reports in the token response (or, if it omits one, the scope requested) is `Tasks.ReadWrite` **and** `TODO_MCP_SCOPE` is `Tasks.ReadWrite`. `TODO_MCP_SCOPE=Tasks.Read` is a ceiling: `login`, `doctor` and `todo_account_status` all report the capped grant, and the five write tools are absent from `tools/list` entirely. |
+| Tool surface follows the *actual* grant in default mode, capped by your config in follow mode | In default mode, write tools are registered only if the scope Microsoft reports in the token response (or, if it omits one, the scope requested) is `Tasks.ReadWrite` **and** `TODO_MCP_SCOPE` is `Tasks.ReadWrite`. With `TODO_MCP_START_WITHOUT_TOKEN=1`, `tools/list` is built from the `TODO_MCP_SCOPE` ceiling and dispatch enforces the live grant; a later widening or narrowing needs no restart. |
 | Never asks for your identity | `openid`, `profile` and `User.Read` are not requested, and the server never calls the profile endpoint `GET /me`: every Graph request it makes is under `/me/todo/`, directly or inside `$batch`. |
 | No task content in the server's logs | No line the server logs carries a task title, body, category, checklist item or list name. A list appears in logs only as an opaque `lst_…` hash (`cache::log_ref`), and a test re-runs its own binary to check the real stderr. [SECURITY.md](SECURITY.md#known-gaps) lists the known gaps. |
 | Task content never touches disk | The cache is memory-only. The volume holds `token.json` (the refresh token) and `bearer.token` (the MCP bearer), never your tasks. |
@@ -159,9 +159,11 @@ missing `TODO_MCP_CLIENT_ID`, 1 a sign-in or token that Microsoft or the server 
 startup, so a grant widened later needs that restart. For a sidecar that should
 wait on the listener before sign-in, set `TODO_MCP_START_WITHOUT_TOKEN=1`; it can
 use Compose's `condition: service_healthy`. This follow mode uses the configured
-scope ceiling, picks up a later login on the next write or account-status call
-without a restart, and reports `auth_required`, `auth_failed`, or the transport
-error until the missing token, Microsoft refusal, or Entra outage is fixed.
+scope ceiling, notices later login, logout, dead-token deletion, and account
+switches on the next tool call, resets token state and task cache, and follows a
+changed live grant without a restart. It reports `auth_required`, `auth_failed`,
+or the transport error until the missing token, Microsoft refusal, or Entra
+outage is fixed.
 
 ```yaml
 services:
@@ -244,7 +246,7 @@ and every problem found is reported at once.
 | `TODO_MCP_CLIENT_SECRET` | — | must be unset | Any value is a startup refusal: this is a public client and never sends a secret. |
 | `TODO_MCP_TZ` | `UTC` (with a warning) | an IANA name, case-insensitive | "Overdue" and "due today" are undefined without it. Set it to the zone Outlook → Settings → Language and time shows. Any IANA name works for reading, but a **dated write** needs a zone Graph can map to a Windows time-zone name: `doctor` shows it as "Windows name for writes", and a write in a zone without one is refused with a nearby zone suggested. Tools also take a per-call `timezone` argument. |
 | `TODO_MCP_SCOPE` | `Tasks.ReadWrite` | `Tasks.ReadWrite` or `Tasks.Read` | A **ceiling**: with `Tasks.Read` the five write tools stay absent even if Microsoft grants `Tasks.ReadWrite`. The stored refresh token is read-only only if the app registration grants just `Tasks.Read`; otherwise `login`, `serve` and `doctor` warn that it can write your tasks. Changing it requires a new `login`. |
-| `TODO_MCP_START_WITHOUT_TOKEN` | `0` | `1`/`0` (also `true`/`false`/`yes`/`no`) | With `1`, the mode is follow mode whether or not the boot refresh succeeds: `/healthz` is 200, the tool list is the `TODO_MCP_SCOPE` ceiling, and a later login is picked up by the next write or `todo_account_status` without a restart. Missing tokens answer `auth_required`, Microsoft refusals answer `auth_failed`, and unreachable Entra returns the transport error until fixed. Refresh failures retry at most every 30 seconds for the same `token.json`; a new `login` retries immediately. An unusable `token.json`, refused grant, configuration, data-directory or bind failure still exits. |
+| `TODO_MCP_START_WITHOUT_TOKEN` | `0` | `1`/`0` (also `true`/`false`/`yes`/`no`) | With `1`, the mode is follow mode whether or not the boot refresh succeeds: `/healthz` is 200, the tool list is the `TODO_MCP_SCOPE` ceiling, and dispatch enforces the live grant. Every tool call stats `token.json`; a changed or vanished file from login, logout, dead-token deletion, or account switching resets token state and task cache, and the next call follows the new grant without a restart. Missing tokens answer `auth_required`, Microsoft refusals answer `auth_failed`, and unreachable Entra returns the transport error until fixed. Refresh failures retry at most every 30 seconds for the same `token.json` but never hide a still-valid access token; a new `login` retries immediately. `todo_account_status` with `check_connectivity:false` touches no network. An unusable `token.json`, refused grant, configuration, data-directory or bind failure still exits. |
 | `TODO_MCP_TENANT` | `common` | a tenant GUID, a verified domain, `organizations` or `consumers` | For a single-tenant app registration (AADSTS50194). |
 | `TODO_MCP_BIND` | `0.0.0.0:8591` | `<ip>:<port>` | Listens on every interface, outside a container too. In the container the compose port mapping (`127.0.0.1:8591`) decides reachability; on a host run set `127.0.0.1:8591`. |
 | `TODO_MCP_DATA_DIR` | `/data` | an absolute path | Created `0700` if missing; a looser mode is a warning. Holds `token.json` (0600), `bearer.token` (0600 when generated), `.token.lock` (0600, the lock every read and write of `token.json` takes) and short-lived `token.json.tmp.*` files. |
@@ -287,7 +289,7 @@ output anywhere.**
 | `0` | Success. `doctor`: no findings. `healthcheck`: healthy. `serve`: stopped by SIGINT/SIGTERM, including during startup or by a second signal; requests still running when the 5 s drain ends (or at a second signal) are abandoned, and a drain-deadline abandonment is logged as a warning. |
 | `1` | A runtime error: Microsoft refused the sign-in, Graph or the network failed, `token.json` is unusable or its grant is refused (a `.All` permission, or no Tasks permission), the port could not be bound, or the signal handlers could not be installed. With `TODO_MCP_START_WITHOUT_TOKEN=1`, a sign-in Microsoft refused or an unreachable Entra keeps `serve` up instead; an unusable `token.json` or a refused grant still exits. `doctor`: at least one finding, invalid configuration included. `healthcheck`: unhealthy for any reason, invalid configuration included — Docker reads `1` as unhealthy and reserves `2`. |
 | `2` | Usage error (an unknown command or flag) or invalid configuration, including a data directory or bearer file that cannot be used. |
-| `3` | Not signed in: `serve` found no `token.json` (logged as `AUTH_REQUIRED`). Run `login`. With `TODO_MCP_START_WITHOUT_TOKEN=1`, `serve` stays up instead; tool calls answer `auth_required`, `auth_failed`, or the transport error according to the cause until it is fixed. |
+| `3` | Not signed in: `serve` found no `token.json` (logged as `AUTH_REQUIRED`). Run `login`. With `TODO_MCP_START_WITHOUT_TOKEN=1`, `serve` stays up instead and tool calls answer `auth_required` until `login` has run. |
 | `130` / `143` | A one-shot command (`login`, `logout`, `token`, `doctor`, `healthcheck`) was interrupted by SIGINT / SIGTERM. `serve` never exits with these. |
 
 ### Signing out and rotating the MCP bearer
@@ -304,11 +306,11 @@ The data directory holds two unrelated credentials, and `logout` touches only on
   when that file exists. That is a local credential with nothing to do with your
   Microsoft account.
 
-A running `serve` keeps using the access token it already holds in memory until that
-token nears expiry, so stop the server too if signing out must take effect at once.
+A running `serve` notices a changed or vanished `token.json` on the next tool call,
+resets its token state and task cache, and no longer uses the signed-out account.
 Its next refresh finds no `token.json` and never writes one back, even if that refresh
 was already under way when you ran `logout`, and it will not start again (exit 3)
-until the next `login`.
+until the next `login`, unless `TODO_MCP_START_WITHOUT_TOKEN=1`.
 
 ```bash
 docker compose run --rm todo-mcp logout

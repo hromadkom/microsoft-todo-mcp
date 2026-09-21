@@ -14,9 +14,10 @@ pub mod entra;
 pub mod store;
 
 use std::fmt;
+use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::SystemTime;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
@@ -276,25 +277,6 @@ pub enum Grant {
     None,
 }
 
-fn grant_to_atomic(grant: Grant) -> u8 {
-    match grant {
-        Grant::ReadWrite => 1,
-        Grant::ReadOnly => 2,
-        Grant::None => {
-            debug_assert!(false, "Grant::None cannot be stored as a live grant");
-            0
-        }
-    }
-}
-
-fn grant_from_atomic(value: u8) -> Option<Grant> {
-    match value {
-        1 => Some(Grant::ReadWrite),
-        2 => Some(Grant::ReadOnly),
-        _ => None,
-    }
-}
-
 impl Grant {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -483,6 +465,27 @@ struct Cached {
     expires_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Default, PartialEq, Eq)]
+enum FileSeen {
+    #[default]
+    Unknown,
+    Absent,
+    Present {
+        mtime: SystemTime,
+        len: u64,
+    },
+}
+
+fn observe_file(dir: &std::path::Path) -> FileSeen {
+    match fs::metadata(dir.join("token.json")) {
+        Ok(meta) => FileSeen::Present {
+            mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            len: meta.len(),
+        },
+        Err(_) => FileSeen::Absent,
+    }
+}
+
 #[derive(Clone)]
 enum FailureKind {
     Entra(Box<EntraFailure>),
@@ -513,9 +516,11 @@ struct ProviderState {
     /// dispatch follows the live grant.
     initial_grant: Option<Grant>,
     live_scope: Option<String>,
+    live_grant: Option<Grant>,
     obtained_at: Option<String>,
     refreshes: u64,
     last_failure: Option<RefreshFailure>,
+    file_seen: FileSeen,
 }
 
 /// Refresh proactively this long before the access token expires.
@@ -530,7 +535,6 @@ pub struct TokenProvider {
     requested_scope: String,
     clock: Arc<dyn Clock>,
     state: Mutex<ProviderState>,
-    live_grant_atomic: AtomicU8,
 }
 
 /// A snapshot for `doctor` / `todo_account_status`. No token material.
@@ -561,7 +565,6 @@ impl TokenProvider {
             requested_scope: requested_scope.to_string(),
             clock,
             state: Mutex::new(ProviderState::default()),
-            live_grant_atomic: AtomicU8::new(0),
         }
     }
 
@@ -584,38 +587,52 @@ impl TokenProvider {
     /// The ONLY thing `graph/` calls. Single-flight in process: the state mutex
     /// is held across the network redeem; the file lock is not (m1 §6).
     pub fn access_token(&self) -> Result<Secret, AuthError> {
-        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.access_token_with_grant().map(|(token, _)| token)
+    }
+
+    pub fn access_token_with_grant(&self) -> Result<(Secret, Grant), AuthError> {
+        self.notice_token_file();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = observe_file(&self.dir);
+        if st.file_seen != FileSeen::Unknown && st.file_seen != seen {
+            self.reset_state_for_file(&mut st, seen);
+        }
         self.refresh_locked(st, self.clock.now())
     }
 
-    /// Like `access_token`, but a token.json written since the last refresh is
-    /// redeemed now instead of when the cached token nears expiry.
-    pub fn access_token_after_login(&self) -> Result<Secret, AuthError> {
+    fn reset_state_for_file(&self, st: &mut ProviderState, seen: FileSeen) {
+        st.cached = None;
+        st.live_scope = None;
+        st.live_grant = None;
+        st.obtained_at = None;
+        st.last_failure = None;
+        st.file_seen = seen;
+    }
+
+    pub fn notice_token_file(&self) -> bool {
+        let _before_lock = observe_file(&self.dir);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.cached.is_some() {
-            match store::load(&self.dir) {
-                Ok(file) => {
-                    self.check_file(&file)?;
-                    if st.obtained_at.as_deref() != Some(file.obtained_at.as_str()) {
-                        st.cached = None;
-                    }
-                }
-                Err(StoreError::NotFound) => st.cached = None,
-                Err(e) => return Err(e.into()),
-            }
+        let seen = observe_file(&self.dir);
+        if st.file_seen == FileSeen::Unknown {
+            st.file_seen = seen;
+            return false;
         }
-        self.refresh_locked(st, self.clock.now())
+        if st.file_seen != seen {
+            self.reset_state_for_file(&mut st, seen);
+            return true;
+        }
+        false
     }
 
     fn refresh_locked(
         &self,
         mut st: MutexGuard<'_, ProviderState>,
         now: DateTime<Utc>,
-    ) -> Result<Secret, AuthError> {
+    ) -> Result<(Secret, Grant), AuthError> {
         if let Some(c) = &st.cached
             && now + REFRESH_SKEW < c.expires_at
         {
-            return Ok(c.token.clone());
+            return Ok((c.token.clone(), st.live_grant.unwrap_or(Grant::None)));
         }
 
         // Bounded: one adoption at most, then we trust the disk.
@@ -626,6 +643,11 @@ impl TokenProvider {
                 && failure.obtained_at == base.obtained_at
                 && now < failure.until
             {
+                if let Some(c) = &st.cached
+                    && now < c.expires_at
+                {
+                    return Ok((c.token.clone(), st.live_grant.unwrap_or(Grant::None)));
+                }
                 return Err(failure.error.to_auth_error());
             }
             let rt = base.refresh_token.clone();
@@ -643,6 +665,11 @@ impl TokenProvider {
                         match store::delete_if_unchanged(&self.dir, &base) {
                             Ok(true) => {
                                 f.token_deleted = true;
+                                st.cached = None;
+                                st.live_scope = None;
+                                st.live_grant = None;
+                                st.obtained_at = None;
+                                st.file_seen = observe_file(&self.dir);
                                 logger::warn(
                                     "deleted token.json: Microsoft says this token can never be used again",
                                     &[("code", serde_json::json!(f.code_label()))],
@@ -660,7 +687,7 @@ impl TokenProvider {
                     }
                     st.last_failure = Some(RefreshFailure {
                         obtained_at: base.obtained_at.clone(),
-                        until: now + REFRESH_FAILURE_BACKOFF,
+                        until: self.clock.now() + REFRESH_FAILURE_BACKOFF,
                         error: FailureKind::Entra(f.clone()),
                     });
                     return Err(AuthError::Entra(f));
@@ -668,9 +695,14 @@ impl TokenProvider {
                 Err(AuthError::Transport(s)) => {
                     st.last_failure = Some(RefreshFailure {
                         obtained_at: base.obtained_at.clone(),
-                        until: now + REFRESH_FAILURE_BACKOFF,
+                        until: self.clock.now() + REFRESH_FAILURE_BACKOFF,
                         error: FailureKind::Transport(s.clone()),
                     });
+                    if let Some(c) = &st.cached
+                        && self.clock.now() < c.expires_at
+                    {
+                        return Ok((c.token.clone(), st.live_grant.unwrap_or(Grant::None)));
+                    }
                     return Err(AuthError::Transport(s));
                 }
                 Err(e) => return Err(e),
@@ -694,11 +726,6 @@ impl TokenProvider {
                 SaveOutcome::Wrote => {
                     let expires_at =
                         self.clock.now() + ChronoDuration::seconds(success.expires_in.max(0));
-                    let previous_live = self.live_grant();
-                    let scope_changed = st.live_scope.as_deref() != Some(granted.as_str());
-                    let extra_scope_warning = scope_changed
-                        .then(|| audit_scope(&granted, &self.requested_scope).warning())
-                        .flatten();
                     st.cached = Some(Cached {
                         token: success.access_token.clone(),
                         expires_at,
@@ -706,26 +733,15 @@ impl TokenProvider {
                     st.refreshes += 1;
                     st.obtained_at = Some(new_file.obtained_at.clone());
                     st.live_scope = Some(granted.clone());
-                    self.live_grant_atomic
-                        .store(grant_to_atomic(grant), Ordering::Release);
+                    st.live_grant = Some(grant);
                     if st.initial_grant.is_none() {
                         st.initial_grant = Some(grant);
-                    } else if previous_live != Some(grant) {
-                        logger::info(
-                            "granted scope changed",
-                            &[
-                                ("was", serde_json::json!(previous_live.map(Grant::as_str))),
-                                ("now", serde_json::json!(grant.as_str())),
-                            ],
-                        );
                     }
                     st.last_failure = None;
+                    st.file_seen = observe_file(&self.dir);
                     let access_token = success.access_token.clone();
                     drop(st);
-                    if let Some(w) = extra_scope_warning {
-                        logger::warn(&w, &[]);
-                    }
-                    return Ok(access_token);
+                    return Ok((access_token, grant));
                 }
                 SaveOutcome::Adopted(disk) => {
                     // A `login` landed while we were on the network. Discard our
@@ -751,7 +767,7 @@ impl TokenProvider {
     pub fn status(&self) -> TokenStatus {
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let initial = st.initial_grant.unwrap_or(Grant::None);
-        let live = self.live_grant().unwrap_or(initial);
+        let live = st.live_grant.unwrap_or(initial);
         TokenStatus {
             initial_grant: initial,
             live_grant: live,
@@ -770,11 +786,6 @@ impl TokenProvider {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .initial_grant
-    }
-
-    /// The most recent successful refresh, read without taking the state lock.
-    pub fn live_grant(&self) -> Option<Grant> {
-        grant_from_atomic(self.live_grant_atomic.load(Ordering::Acquire))
     }
 }
 

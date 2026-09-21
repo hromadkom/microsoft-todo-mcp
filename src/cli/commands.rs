@@ -14,8 +14,8 @@ use crate::auth::entra::EntraClient;
 use crate::auth::store::{self, SaveMode, TokenFile};
 use crate::auth::{
     AuthError, Grant, REVOKE_CONSENT_PATHS, TokenProvider, TokenSuccess, audit_scope,
-    effective_scope, forbidden_scope_message, grant_from_scope, keeps_serving_without_token,
-    scope_short_names, stored_forbidden_scope_message, vet_grant,
+    effective_scope, forbidden_scope_message, grant_from_scope, scope_short_names,
+    stored_forbidden_scope_message, vet_grant,
 };
 use crate::clock::SystemClock;
 use crate::config::{Config, Need, ScopeChoice, load_config, validate_data_dir};
@@ -183,7 +183,7 @@ pub fn serve() -> Result<i32, AppError> {
 
     // The opt-in flag selects follow mode even when the boot refresh succeeds.
     let tokens = Arc::new(token_provider(&cfg));
-    let signed_in = match tokens.access_token() {
+    let boot = match tokens.access_token() {
         Ok(_) => {
             let grant = tokens.initial_grant().unwrap_or(Grant::None);
             if grant == Grant::None {
@@ -191,43 +191,55 @@ pub fn serve() -> Result<i32, AppError> {
                     "the granted scope carries neither Tasks.Read nor Tasks.ReadWrite".into(),
                 ));
             }
-            true
+            Some(grant)
         }
         Err(e) => {
             if let AuthError::Entra(f) = &e {
                 logger::error(&f.render(), &[]);
             }
-            if !cfg.start_without_token || !keeps_serving_without_token(&e) {
-                return Err(e.into());
+            match &e {
+                AuthError::NotLoggedIn if cfg.start_without_token => {
+                    let app: AppError = e.into();
+                    logger::error(&app.message(), &[("code", json!(app.code()))]);
+                    logger::warn(
+                        &format!(
+                            "serving without a Microsoft sign-in (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls answer auth_required until a login lands; {LOGIN_HINT}"
+                        ),
+                        &[],
+                    );
+                    None
+                }
+                AuthError::Transport(_) if cfg.start_without_token => {
+                    let app: AppError = e.into();
+                    logger::error(&app.message(), &[("code", json!(app.code()))]);
+                    logger::warn(
+                        "serving while Entra is unreachable (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls fail with the transport error until Entra answers; the next tool call retries",
+                        &[],
+                    );
+                    None
+                }
+                AuthError::Entra(_) if cfg.start_without_token => {
+                    let app: AppError = e.into();
+                    logger::error(&app.message(), &[("code", json!(app.code()))]);
+                    logger::warn(
+                        &format!(
+                            "serving although Microsoft refused the sign-in (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls answer auth_failed (auth_required once a dead refresh token has been deleted) until a login lands or the app registration is fixed; {LOGIN_HINT}"
+                        ),
+                        &[],
+                    );
+                    None
+                }
+                _ => return Err(e.into()),
             }
-            let warning = match &e {
-                AuthError::NotLoggedIn => format!(
-                    "serving without a Microsoft sign-in (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls answer auth_required until a login lands; {LOGIN_HINT}"
-                ),
-                AuthError::Transport(_) => "serving while Entra is unreachable (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls fail with the transport error until Entra answers; the next tool call retries".to_string(),
-                AuthError::Entra(_) => "serving although Microsoft refused the sign-in (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls answer auth_failed until a login lands or the app registration is fixed".to_string(),
-                _ => unreachable!("keeps_serving_without_token filtered this error"),
-            };
-            let app: AppError = e.into();
-            logger::error(&app.message(), &[("code", json!(app.code()))]);
-            logger::warn(&warning, &[]);
-            false
         }
     };
-    let boot_grant = if cfg.start_without_token {
-        None
-    } else {
-        Some(
-            tokens
-                .initial_grant()
-                .expect("successful boot refresh grant"),
-        )
-    };
+    let signed_in = boot.is_some();
+    let boot_grant = if cfg.start_without_token { None } else { boot };
     // Once, at boot, and only scope names: extra granted scopes are warned about
     // the same way login and doctor do.
+    let startup_status = tokens.status();
     if signed_in
-        && let Some(w) = tokens
-            .status()
+        && let Some(w) = startup_status
             .live_scope
             .as_deref()
             .and_then(|s| audit_scope(s, &cfg.scope.requested()).warning())
@@ -260,7 +272,11 @@ pub fn serve() -> Result<i32, AppError> {
             ("version", json!(env!("CARGO_PKG_VERSION"))),
             (
                 "grant",
-                json!(tokens.live_grant().map(Grant::as_str).unwrap_or("none")),
+                json!(if startup_status.live_scope.is_some() {
+                    startup_status.live_grant.as_str()
+                } else {
+                    "none"
+                }),
             ),
             ("tools", json!(tools)),
             ("signed_in", json!(signed_in)),
