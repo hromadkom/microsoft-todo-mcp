@@ -923,7 +923,11 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
         json!({ "checked": false, "ok": Value::Null, "detail": Value::Null })
     };
     let ts = state.graph.tokens().status();
-    let eff = state.effective_grant();
+    let eff = if state.follows_logins() {
+        ts.live_scope.is_some().then_some(ts.live_grant)
+    } else {
+        state.boot_grant()
+    };
     let live = if ts.live_scope.is_some() {
         ts.live_grant
     } else {

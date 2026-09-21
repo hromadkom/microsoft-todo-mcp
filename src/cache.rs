@@ -457,14 +457,12 @@ mod tests {
     }
 
     #[test]
-    fn account_reset_generation_rejects_an_in_flight_put() {
+    fn reset_for_new_account_sets_pending_mailbox_and_bumps_generation() {
         let mut c = Cache::new(120, 5000);
-        let t0 = Instant::now();
+        c.put_catalogue(vec![list("L1", Some("defaultList"))], Instant::now());
         let generation = c.generation();
         c.reset_for_new_account();
-        if c.generation() == generation {
-            c.put_catalogue(vec![list("L1", Some("defaultList"))], t0);
-        }
+        assert!(c.generation() > generation);
         assert!(c.catalogue_any().is_none());
         assert_eq!(c.mailbox_id, "mbx_pending");
     }

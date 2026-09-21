@@ -189,9 +189,6 @@ pub fn serve() -> Result<i32, AppError> {
         GrantLog::Frozen
     };
     let tokens = Arc::new(token_provider(&cfg, mode));
-    if cfg.start_without_token {
-        tokens.follow_live_grant();
-    }
     let boot = match tokens.access_token() {
         Ok(_) => {
             let grant = tokens.initial_grant().unwrap_or(Grant::None);

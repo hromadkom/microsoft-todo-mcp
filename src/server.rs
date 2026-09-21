@@ -158,10 +158,6 @@ impl ServerState {
         self.boot_grant
     }
 
-    pub fn effective_grant(&self) -> Option<Grant> {
-        self.boot_grant.or_else(|| self.graph.tokens().live_grant())
-    }
-
     pub fn follows_logins(&self) -> bool {
         self.cfg.start_without_token
     }

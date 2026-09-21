@@ -193,9 +193,9 @@ fn follow_mode_account_switch_resets_cache_before_refetch() {
     assert!(first.get("isError").is_none(), "{first}");
     let before = h.graph_requests();
     let mut replacement = store::load(&h.dir).expect("token");
-    replacement.account_id = "switched".into();
     replacement.refresh_token = Secret::new("RT-SWITCHED");
     replacement.obtained_at = "2026-08-25T13:50:05.113000Z".into();
+    replacement.obtained_by = "device_code".into();
     store::save_atomic(&h.dir, &replacement, None, SaveMode::Login).expect("switch account");
     let second = h.call("todo_lists", json!({}));
     assert!(second.get("isError").is_none(), "{second}");

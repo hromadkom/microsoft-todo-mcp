@@ -15,7 +15,6 @@ pub mod store;
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -276,23 +275,6 @@ pub enum Grant {
     None,
 }
 
-fn grant_code(grant: Grant) -> u8 {
-    match grant {
-        Grant::ReadWrite => 1,
-        Grant::ReadOnly => 2,
-        Grant::None => 3,
-    }
-}
-
-fn grant_from_code(code: u8) -> Option<Grant> {
-    match code {
-        1 => Some(Grant::ReadWrite),
-        2 => Some(Grant::ReadOnly),
-        3 => Some(Grant::None),
-        _ => None,
-    }
-}
-
 impl Grant {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -519,7 +501,6 @@ struct ProviderState {
     initial_grant: Option<Grant>,
     live_scope: Option<String>,
     live_grant: Option<Grant>,
-    account_id: Option<String>,
     obtained_at: Option<String>,
     refreshes: u64,
     last_failure: Option<RefreshFailure>,
@@ -538,8 +519,6 @@ pub struct TokenProvider {
     requested_scope: String,
     clock: Arc<dyn Clock>,
     mode: GrantLog,
-    live_grant_atomic: AtomicU8,
-    follow_live_grant: AtomicBool,
     state: Mutex<ProviderState>,
 }
 
@@ -579,22 +558,12 @@ impl TokenProvider {
             requested_scope: requested_scope.to_string(),
             clock,
             mode,
-            live_grant_atomic: AtomicU8::new(0),
-            follow_live_grant: AtomicBool::new(false),
             state: Mutex::new(ProviderState::default()),
         }
     }
 
     pub fn dir(&self) -> &std::path::Path {
         &self.dir
-    }
-
-    pub fn live_grant(&self) -> Option<Grant> {
-        grant_from_code(self.live_grant_atomic.load(Ordering::Acquire))
-    }
-
-    pub fn follow_live_grant(&self) {
-        self.follow_live_grant.store(true, Ordering::Release);
     }
 
     /// Validate the on-disk file against this process's configuration.
@@ -625,8 +594,6 @@ impl TokenProvider {
         st.cached = None;
         st.live_scope = None;
         st.live_grant = None;
-        st.account_id = None;
-        self.live_grant_atomic.store(0, Ordering::Release);
         st.obtained_at = None;
         st.last_failure = None;
         st.file_seen = seen;
@@ -645,7 +612,6 @@ impl TokenProvider {
                 && file.obtained_by == "refresh"
                 && file.client_id == self.client_id
                 && file.requested_scope == self.requested_scope
-                && Some(file.account_id.as_str()) == st.account_id.as_deref()
                 && Some(file.granted_scope.as_str()) == st.live_scope.as_deref()
             {
                 st.obtained_at = Some(file.obtained_at);
@@ -783,9 +749,6 @@ impl TokenProvider {
                     st.obtained_at = Some(new_file.obtained_at.clone());
                     st.live_scope = Some(granted.clone());
                     st.live_grant = Some(grant);
-                    st.account_id = Some(new_file.account_id.clone());
-                    self.live_grant_atomic
-                        .store(grant_code(grant), Ordering::Release);
                     if st.initial_grant.is_none() {
                         st.initial_grant = Some(grant);
                     }
@@ -797,9 +760,7 @@ impl TokenProvider {
                     .flatten();
                     let grant_transition = match self.mode {
                         GrantLog::Frozen
-                            if !self.follow_live_grant.load(Ordering::Acquire)
-                                && st.initial_grant.is_some()
-                                && st.initial_grant != Some(grant) =>
+                            if st.initial_grant.is_some() && st.initial_grant != Some(grant) =>
                         {
                             Some((
                                 "frozen",

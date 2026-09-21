@@ -161,7 +161,9 @@ wait on the listener before sign-in, set `TODO_MCP_START_WITHOUT_TOKEN=1`; it ca
 use Compose's `condition: service_healthy`. This follow mode uses the configured
 scope ceiling, notices later login, logout, dead-token deletion, and account
 switches on the next tool call, resets token state and task cache, and follows a
-changed live grant without a restart. It reports `auth_required`, `auth_failed`,
+changed live grant without a restart. A `login` file (`obtained_by: "device_code"`)
+or a changed scope resets state; a refresh rotation of the same chain is adopted
+silently. It reports `auth_required`, `auth_failed`,
 or the transport error until the missing token, Microsoft refusal, or Entra
 outage is fixed.
 
