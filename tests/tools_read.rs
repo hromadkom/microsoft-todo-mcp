@@ -234,14 +234,45 @@ fn follow_mode_refresh_rotation_keeps_cache_and_token_state() {
     let before = h.graph_requests();
     let base = store::load(&h.dir).expect("token");
     let mut rotation = base.clone();
-    let previous_obtained_at = rotation.obtained_at.clone();
     rotation.obtained_at = "2026-08-25T13:50:05.113000Z".into();
     rotation.obtained_by = "refresh".into();
-    rotation.rotated_from = Some(previous_obtained_at);
     store::save_atomic(&h.dir, &rotation, Some(&base), SaveMode::Refresh).expect("rotate");
     let second = h.call("todo_lists", json!({}));
     assert!(second.get("isError").is_none(), "{second}");
     assert_eq!(h.graph_requests(), before, "rotation reset the warm cache");
+}
+
+#[test]
+fn follow_mode_status_reports_unknown_grant_after_login_until_next_graph_call() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+    let first = h.call("todo_lists", json!({}));
+    assert!(first.get("isError").is_none(), "{first}");
+
+    let mut replacement = store::load(&h.dir).expect("token");
+    replacement.obtained_at = "2026-08-25T13:50:05.113000Z".into();
+    replacement.obtained_by = "device_code".into();
+    replacement.refresh_token = Secret::new("RT-LOGIN");
+    store::save_atomic(&h.dir, &replacement, None, SaveMode::Login).expect("login");
+
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["token"]["present"], true,
+        "{status}"
+    );
+    assert_eq!(
+        status["structuredContent"]["write_tools_enabled"],
+        Value::Null,
+        "{status}"
+    );
+
+    let second = h.call("todo_lists", json!({}));
+    assert!(second.get("isError").is_none(), "{second}");
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["write_tools_enabled"], true,
+        "{status}"
+    );
 }
 
 #[test]

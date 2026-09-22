@@ -11,7 +11,7 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -33,6 +33,7 @@ pub enum FileSeen {
     Present {
         mtime: Option<SystemTime>,
         len: u64,
+        ino: u64,
     },
 }
 
@@ -41,6 +42,7 @@ pub fn observe(dir: &Path) -> FileSeen {
         Ok(meta) => FileSeen::Present {
             mtime: meta.modified().ok(),
             len: meta.len(),
+            ino: meta.ino(),
         },
         Err(_) => FileSeen::Absent,
     }
@@ -361,7 +363,6 @@ mod tests {
 
     #[test]
     fn writes_0600_and_reads_back() {
-        use std::os::unix::fs::MetadataExt;
         let dir = tmp_dir("rw");
         let f = file("RT-1", "2026-08-25T13:49:05.113000Z");
         assert!(matches!(
@@ -376,6 +377,55 @@ mod tests {
         // No access token, ever.
         let raw = fs::read_to_string(dir.join(TOKEN_FILE)).unwrap();
         assert!(!raw.contains("access_token"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn observation_detects_same_length_rewrite_with_same_mtime() {
+        let dir = tmp_dir("inode");
+        let first = file("RT-1", "2026-08-25T13:49:05.113000Z");
+        let first_seen = match save_atomic(&dir, &first, None, SaveMode::Login).unwrap() {
+            SaveOutcome::Wrote(seen) => seen,
+            SaveOutcome::Adopted(_) => panic!("login cannot adopt"),
+        };
+        let first_mtime = match &first_seen {
+            FileSeen::Present {
+                mtime: Some(mtime), ..
+            } => *mtime,
+            _ => panic!("first write was not observed"),
+        };
+
+        let second = file("RT-2", "2026-08-25T13:49:05.113000Z");
+        assert!(matches!(
+            save_atomic(&dir, &second, None, SaveMode::Login).unwrap(),
+            SaveOutcome::Wrote(_)
+        ));
+        File::open(dir.join(TOKEN_FILE))
+            .unwrap()
+            .set_modified(first_mtime)
+            .unwrap();
+
+        let second_seen = observe(&dir);
+        assert_ne!(first_seen, second_seen);
+        match (first_seen, second_seen) {
+            (
+                FileSeen::Present {
+                    mtime: first_mtime,
+                    len: first_len,
+                    ino: first_ino,
+                },
+                FileSeen::Present {
+                    mtime: second_mtime,
+                    len: second_len,
+                    ino: second_ino,
+                },
+            ) => {
+                assert_eq!(first_mtime, second_mtime);
+                assert_eq!(first_len, second_len);
+                assert_ne!(first_ino, second_ino);
+            }
+            _ => panic!("both writes should produce present observations"),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

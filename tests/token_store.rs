@@ -70,6 +70,7 @@ fn a_login_under_a_running_refresh_wins_and_is_adopted() {
     let barrier = Arc::new(Barrier::new(2));
     *endpoint.barrier.lock().unwrap() = Some(barrier.clone());
     let p = provider(&dir, endpoint.clone(), CLIENT_ID, SCOPE);
+    let epoch_before = p.epoch();
 
     let refresher = {
         let p = p.clone();
@@ -112,6 +113,11 @@ fn a_login_under_a_running_refresh_wins_and_is_adopted() {
         seen,
         vec!["RT-OLD".to_string(), "RT-NEW".to_string()],
         "adopted RT-NEW after the login landed"
+    );
+    assert_ne!(
+        p.epoch(),
+        epoch_before,
+        "adopting the login did not advance epoch"
     );
 }
 

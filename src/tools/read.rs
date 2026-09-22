@@ -934,12 +934,17 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
         eff.unwrap_or(Grant::None)
     };
     let restart_reason = state.restart_reason_for(ts.live_scope.is_some().then_some(ts.live_grant));
-    let write_enabled = if state.follows_logins() {
+    let writes_are_enabled = if state.follows_logins() {
         eff == Some(Grant::ReadWrite) && ts.live_scope.is_some()
     } else {
         state.boot_grant() == Some(Grant::ReadWrite) && ts.file_present
     };
-    let widened = !write_enabled && live == Grant::ReadWrite;
+    let write_enabled = if state.follows_logins() && ts.file_present && ts.live_scope.is_none() {
+        Value::Null
+    } else {
+        json!(writes_are_enabled)
+    };
+    let widened = !writes_are_enabled && live == Grant::ReadWrite;
     let stats = state.cache_read().stats(std::time::Instant::now());
     let gs = state.graph.stats();
     let client_tail: String = state

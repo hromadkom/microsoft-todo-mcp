@@ -307,7 +307,7 @@ pub fn all(tz: &str) -> Vec<Value> {
         json!({
             "name": "todo_account_status",
             "title": "Account and server status",
-            "description": "The signed-in grant, granted scopes, whether write tools are enabled (frozen at startup, or following the live grant with TODO_MCP_START_WITHOUT_TOKEN) and whether a restart is required, token horizon, time zone, cache and Graph counters. No token material. check_connectivity:true issues one tiny Graph request (plus any retries); false touches no network. Never calls the profile endpoint GET /me (every request is under /me/todo/, directly or inside $batch); identity is not requested.",
+            "description": "The signed-in grant, granted scopes, whether write tools are enabled (frozen at startup, or following the live grant with TODO_MCP_START_WITHOUT_TOKEN) and whether a restart is required, token horizon, time zone, cache and Graph counters. In follow mode the grant is unknown until the first Graph call after a login, so write_tools_enabled is null during that interval. No token material. check_connectivity:true issues one tiny Graph request (plus any retries); false touches no network. Never calls the profile endpoint GET /me (every request is under /me/todo/, directly or inside $batch); identity is not requested.",
             "inputSchema": obj(json!({
                 "check_connectivity": { "type": "boolean", "description": "Default false." },
             }), &[]),
@@ -316,7 +316,7 @@ pub fn all(tz: &str) -> Vec<Value> {
                 "identity": { "type": "string" },
                 "grant": { "type": "string", "enum": ["Tasks.ReadWrite", "Tasks.Read", "none"] },
                 "scopes_granted": { "type": "array", "items": { "type": "string" } },
-                "write_tools_enabled": { "type": "boolean" },
+                "write_tools_enabled": { "type": ["boolean", "null"], "description": "Null in follow mode until the first Graph call after a login establishes the live grant." },
                 "restart_required": { "type": "boolean" },
                 "restart_reason": ns(),
                 "token": obj(json!({

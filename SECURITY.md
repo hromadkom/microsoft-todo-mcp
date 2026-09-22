@@ -72,7 +72,7 @@ Consequences:
 - When Microsoft reports the refresh token dead during a refresh (AADSTS70008, 700082
   or 530036), `serve` and `doctor` delete `token.json`, but only if no newer sign-in has
   replaced it in the meantime.
-- Every tool call stats `token.json` in both modes. A changed or vanished file from a
+- Every tool call stats `token.json` (mtime, length and inode) in both modes. A changed or vanished file from a
   later login, logout, dead-token deletion, or account switch resets token state and
   the task cache; a same-chain refresh rotation, including one written by `doctor`, is
   adopted silently only when its `rotated_from` names the prior file, and follow mode
