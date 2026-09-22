@@ -57,7 +57,7 @@ subtle = { version = "2.6", default-features = false }
 # CSPRNG for the auto-generated bearer token. Already compiled via ring, so a direct
 # dependency costs ~0 bytes and avoids a /dev/urandom code path that FROM scratch
 # may not provide.
-getrandom = "0.2"
+getrandom = "0.4"
 
 [features]
 # NOT in default. Gates UreqTransport::with_base (a Graph transport that allows
