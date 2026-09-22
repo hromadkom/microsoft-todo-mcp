@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`timezone_mode` no longer reports `client_side` on a mailbox that honours the
+  preference.** Graph applies `Prefer: outlook.timezone` on `/me/todo/*` without
+  ever sending `Preference-Applied`, so the header-only check settled the wrong
+  answer on every real account. The mode is now judged by the first read that
+  carries a dated field (a `$batch` first page counts): echoed in the requested
+  zone is `server_side`, in another zone `client_side`; a read with no dated field
+  leaves it open. (`docs/graph-probe.md`)
+
+### Changed
+
+- First live-account run recorded in `docs/graph-probe.md`: `$batch` accepted,
+  every `ALIAS_FALLBACK` zone name accepted on a dated write, `null` clears every
+  field, Claude Code negotiates `2025-11-25`, the release image's first TLS
+  handshake on a worker thread works, idle RSS measured. Tool descriptions now say
+  that Graph derives the dates of a recurring task from `range.startDate` and that
+  clearing the due date also removes the start date and recurrence.
+
 ## [1.0.1] - 2026-09-22
 
 ### Added

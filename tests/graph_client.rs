@@ -409,3 +409,40 @@ fn a_400_on_the_timezone_preference_degrades_once_and_reads_keep_working() {
     h.state.cache_write().invalidate_list(&l);
     assert!(h.state.graph.list_tasks(&l, &mut budget).is_err());
 }
+
+// Graph applies `outlook.timezone` on /me/todo/* without ever sending
+// `Preference-Applied` (docs/graph-probe.md), so the mode is judged by the body.
+#[test]
+fn timezone_mode_settles_from_a_dated_field_echoed_in_the_requested_zone() {
+    let h = harness(&[]);
+    let l = h.fx.add_list("Tasks", Some("defaultList"));
+    // The harness runs under Europe/Prague, so the preference asks for this name.
+    h.fx.add_task_full(
+        &l,
+        json!({ "title": "dated" }),
+        Some((
+            "2026-08-26T00:00:00.0000000".into(),
+            "Central Europe Standard Time".into(),
+        )),
+    );
+    assert_eq!(h.state.graph.stats().timezone_mode, None);
+    let mut budget = Budget::for_tool(10_000, 50);
+    h.state.graph.list_tasks(&l, &mut budget).unwrap();
+    assert_eq!(h.state.graph.stats().timezone_mode, Some("server_side"));
+}
+
+#[test]
+fn timezone_mode_stays_open_until_a_read_carries_a_dated_field() {
+    let h = harness(&[]);
+    let l = h.fx.add_list("Tasks", Some("defaultList"));
+    h.fx.add_task_full(&l, json!({ "title": "undated" }), None);
+    let mut budget = Budget::for_tool(10_000, 50);
+    // A catalogue page and an undated task page carry no `timeZone` at all.
+    h.state.graph.list_lists(&mut budget).unwrap();
+    h.state.graph.list_tasks(&l, &mut budget).unwrap();
+    assert_eq!(h.state.graph.stats().timezone_mode, None);
+    // A task echoed in some other zone settles client_side.
+    h.fx.add_task(&l, "utc-dated", Some("2026-08-26"), "notStarted");
+    h.state.graph.list_tasks(&l, &mut budget).unwrap();
+    assert_eq!(h.state.graph.stats().timezone_mode, Some("client_side"));
+}

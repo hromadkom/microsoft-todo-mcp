@@ -76,10 +76,20 @@ investigated. It is accepted for v0.1.0, not overlooked.
 
 ## Idle RSS
 
-Not yet measured (needs a signed-in server). `serve` refuses to start without a
-token, so an RSS figure needs a real login. Measure with
-`docker stats --no-stream` on the running container, once cold and once after a
-`todo_lists` call. `compose.yaml` caps the container at `mem_limit: 96m`.
+Measured 2026-09-22 on macOS arm64 Docker Desktop (engine 29.7.2), image
+`hromadkom/microsoft-todo-mcp:1.0.1` started by `compose.yaml`, read with
+`docker stats --no-stream` (`docs/graph-probe.md` has the run):
+
+| State | RSS | Headroom against `mem_limit: 96m` |
+|---|---|---|
+| Signed in, cold, just `healthy` (boot refresh done, no request yet) | 3.58 MiB | ~92 MiB |
+| Signed in, after `todo_lists` (catalogue + `$batch`, TLS session, 2 lists cached) | 4.19 MiB | ~92 MiB |
+| Signed in, after ~60 tool calls incl. writes and a 42-task search | 7.96 MiB | ~88 MiB |
+| Follow mode (no token), cold | 6.16 MiB | ~90 MiB |
+| Follow mode, after Claude Code's `initialize` + `tools/list` | 7.92 MiB | ~88 MiB |
+
+The cold figures vary by a few MiB between starts (allocator arena timing); the
+ceiling after sustained use stayed under 8 MiB, an order of magnitude below the cap.
 
 ## Commands
 

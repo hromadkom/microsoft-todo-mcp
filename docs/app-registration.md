@@ -224,8 +224,13 @@ it back:
 Then run `login` again. `logout` is not a substitute: it deletes `token.json` but
 revokes nothing at Microsoft.
 
-> Like the rest of this page, these click paths have not yet been verified against
-> a live portal.
+> These click paths have not yet been verified against a live portal. What *has*
+> been observed (2026-09-22, single-tenant work account, `docs/graph-probe.md`):
+> the granted scope string was `profile openid email
+> https://graph.microsoft.com/Tasks.ReadWrite https://graph.microsoft.com/User.Read`
+> — the portal's default `User.Read` plus the OpenID trio, no `.All` — so the
+> "Microsoft also granted …" warning is the normal first-run outcome, and revoking
+> is the only way to make it go away.
 
 ---
 

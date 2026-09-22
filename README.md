@@ -67,8 +67,8 @@ to my shopping list" is one call. The five write tools exist only under a
 | `todo_agenda` | The "plan my day" primitive — overdue / due today / due soon / no due date / flagged emails / recently completed in **one** call. |
 | `todo_get_task` | Full fidelity for one task incl. checklist, linked resources and attachment *metadata* (never bytes). |
 | `todo_account_status` | Grant, granted scopes, whether write tools are enabled, token expiry, time zone, cache and Graph counters. No identity, no token material. |
-| `todo_create_tasks` | Create 1–25 with body, dates, reminder, importance, categories, checklist (up to 20 items each), recurrence. |
-| `todo_update_tasks` | Update 1–25. Clearing uses explicit `clear_*` booleans, never nullables. |
+| `todo_create_tasks` | Create 1–25 with body, dates, reminder, importance, categories, checklist (up to 20 items each), recurrence. With a recurrence, Graph sets the due and start dates itself from `range.startDate`; the echoed task shows what stuck. |
+| `todo_update_tasks` | Update 1–25. Clearing uses explicit `clear_*` booleans, never nullables. `clear_due_date` also drops the start date and recurrence — that is Graph's rule, not a choice. |
 | `todo_complete_tasks` | Complete/reopen 1–50. |
 | `todo_delete_tasks` | Delete 1–50, permanently. Requires `confirm: true`. Refuses `flaggedEmails`. |
 | `todo_manage_checklist` | Declarative add/check/uncheck/rename/remove on one task, up to 20 of each, in one call. `remove` requires `confirm: true`. |
@@ -210,14 +210,15 @@ that survives across client sessions.
 
 It negotiates MCP protocol versions `2025-11-25`, `2025-06-18`, `2025-03-26` and
 `2024-11-05`; a client asking for any other version is answered with `2025-11-25`.
-Which version each client actually negotiates has not been recorded yet.
+The version each client negotiates is in the table; the captured handshakes are in
+[docs/graph-probe.md](docs/graph-probe.md).
 
-| Client | Status |
-|---|---|
-| **Claude Code** | ⏳ Expected to work — the legacy `initialize` handshake it falls back to is what this server speaks; not yet run against this server |
-| **Claude Desktop → Code tab** | ⏳ Expected to work (it *is* Claude Code); not yet run |
-| **Claude Desktop → chat** | ❌ **Not supported.** Its config schema requires `command`; `url`/`headers` entries are silently stripped. Remote connectors run from Anthropic's cloud and cannot reach localhost. |
-| **Hermes Agent** | ⏳ Untested |
+| Client | Negotiated `protocolVersion` | Status |
+|---|---|---|
+| **Claude Code** | `2025-11-25` (client 2.1.278, server 1.0.1) | ✅ Handshake verified: `initialize` asks for `2025-11-25` and is answered `2025-11-25`; `notifications/initialized` and `tools/list` follow with `MCP-Protocol-Version: 2025-11-25`. Before `initialize` it sends a `server/discover` request with `MCP-Protocol-Version: 2026-07-28`, which this server answers with JSON-RPC `-32601 Method not found`; the client tolerates that and proceeds. A tool call against a signed-in account has not been run yet |
+| **Claude Desktop → Code tab** | as Claude Code | ⏳ Expected to work (it *is* Claude Code); not separately run |
+| **Claude Desktop → chat** | — | ❌ **Not supported.** Its config schema requires `command`; `url`/`headers` entries are silently stripped. Remote connectors run from Anthropic's cloud and cannot reach localhost. |
+| **Hermes Agent** | not recorded | ⏳ Untested |
 
 If a client can only speak stdio, the answer is a user-run bridge you install, not
 a transport in this codebase:
