@@ -122,8 +122,10 @@ convention; read it before a non-trivial change. The load-bearing ones:
 - **One scope policy: `auth::vet_grant`.** Do not decide what a grant allows anywhere
   else.
 - **No user content in a log line.** No `logger::` call may carry a task title, body,
-  category, checklist item, list name or a Graph `error.message`. Name a list with
-  `cache::log_ref("lst", &id)`.
+  category, checklist item, list name, a Graph `error.message` or an Entra
+  `error_description` (it can quote the account name). Name a list with
+  `cache::log_ref("lst", &id)`; log an Entra refusal through
+  `EntraFailure::log_error`, never `render()`.
 - **No host time zone.** Wall-clock reads go through the injected `Clock`.
   `domain/datetime.rs` is the only caller of `from_local_datetime`.
 - **No panics across the tool boundary.** A domain error is an `{ "isError": true }` tool
