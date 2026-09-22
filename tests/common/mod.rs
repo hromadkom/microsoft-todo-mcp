@@ -158,8 +158,14 @@ impl Fixture {
                         ) {
                             resp = resp.with_header(h);
                         }
-                        let _ = req.respond(resp);
+                        // Decrement BEFORE responding. The client releases its
+                        // permit the moment it has read the response, so a
+                        // decrement after `respond` returns leaves a window in
+                        // which a fifth request is accepted while four are still
+                        // counted — a flaky "peak 5" on a loaded CI runner. Counted
+                        // this way, in-flight never exceeds the permits held.
                         i.fetch_sub(1, Ordering::SeqCst);
+                        let _ = req.respond(resp);
                     }
                 }));
             }
