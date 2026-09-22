@@ -1,6 +1,6 @@
 [package]
 name = "microsoft-todo-mcp"
-version = "1.0.0"
+version = "1.0.1"
 description = "MCP server exposing only Microsoft To Do, over Streamable HTTP, on a single delegated Graph scope"
 authors = ["Martin Hromádko <hromadko.m@gmail.com>"]
 edition = "2024"
