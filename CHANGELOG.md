@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-22
+
 ### Added
 
 - **Opt-in startup without a sign-in.** `TODO_MCP_START_WITHOUT_TOKEN=1` selects
@@ -109,5 +111,6 @@ First public release.
   in time is reported in `failed[]` with `error_code: deadline`; a checklist item of a
   newly created task that was not reached is reported in `warnings[]`.
 
-[Unreleased]: https://github.com/hromadkom/microsoft-todo-mcp/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/hromadkom/microsoft-todo-mcp/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/hromadkom/microsoft-todo-mcp/compare/v0.1.0...v1.0.1
 [0.1.0]: https://github.com/hromadkom/microsoft-todo-mcp/releases/tag/v0.1.0

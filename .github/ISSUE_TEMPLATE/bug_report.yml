@@ -48,7 +48,7 @@ body:
     attributes:
       label: Version
       description: "`docker compose run --rm todo-mcp --version`, or the image tag. `GET /healthz` and the `initialize` response's `serverInfo` report it too."
-      placeholder: "todo-mcp 0.1.0"
+      placeholder: "todo-mcp 1.0.1"
     validations:
       required: true
 
