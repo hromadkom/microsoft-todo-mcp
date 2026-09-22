@@ -11,7 +11,7 @@ use common::{CLIENT_ID, StubEndpoint, config, pinned_now, temp_dir, write_token_
 use microsoft_todo_mcp::auth::entra::{TokenErrorBody, failure_from};
 use microsoft_todo_mcp::auth::store::{self, SaveMode, TokenFile};
 use microsoft_todo_mcp::auth::{
-    AuthError, Grant, GrantLog, Secret, TokenEndpoint, TokenProvider, TokenSuccess,
+    AuthError, Grant, ProviderMode, Secret, TokenEndpoint, TokenProvider, TokenSuccess,
 };
 use microsoft_todo_mcp::cli::commands::{LoginOutcome, finish_login};
 use microsoft_todo_mcp::cli::exit;
@@ -58,7 +58,7 @@ fn provider_with_clock(
         AUTHORITY,
         scope,
         clock,
-        GrantLog::Silent,
+        ProviderMode::OneShot,
     ))
 }
 
@@ -87,6 +87,7 @@ fn a_login_under_a_running_refresh_wins_and_is_adopted() {
         refresh_token: Secret::new("RT-NEW"),
         obtained_at: "2026-08-25T13:50:00.000000Z".into(),
         obtained_by: "device_code".into(),
+        rotated_from: None,
     };
     // Wait until the refresher has reached the endpoint before writing.
     while endpoint.calls() == 0 {
@@ -538,7 +539,7 @@ fn refusing_provider(dir: &std::path::Path, endpoint: Refuses) -> TokenProvider 
         AUTHORITY,
         SCOPE,
         Arc::new(FixedClock::at(pinned_now())),
-        GrantLog::Silent,
+        ProviderMode::OneShot,
     )
 }
 
@@ -559,7 +560,7 @@ fn a_non_deleting_entra_refusal_keeps_a_still_valid_cached_token() {
         AUTHORITY,
         SCOPE,
         clock.clone(),
-        GrantLog::Silent,
+        ProviderMode::OneShot,
     );
     let first = p.access_token().expect("initial token");
     clock.set(pinned_now() + Duration::seconds(3590));
@@ -643,6 +644,7 @@ fn a_login_during_a_dead_token_refresh_is_neither_deleted_nor_redeemed() {
         refresh_token: Secret::new("RT-NEW"),
         obtained_at: "2026-08-25T13:50:00.000000Z".into(),
         obtained_by: "device_code".into(),
+        rotated_from: None,
     };
     store::save_atomic(&dir, &login, None, SaveMode::Login).unwrap();
     barrier.wait();

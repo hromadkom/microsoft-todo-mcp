@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use microsoft_todo_mcp::auth::store::{self, SaveMode, TokenFile};
 use microsoft_todo_mcp::auth::{
-    AuthError, Grant, GrantLog, Secret, TokenEndpoint, TokenProvider, TokenSuccess,
+    AuthError, Grant, ProviderMode, Secret, TokenEndpoint, TokenProvider, TokenSuccess,
 };
 use microsoft_todo_mcp::clock::FixedClock;
 use microsoft_todo_mcp::config::{Config, Need, load_config};
@@ -748,6 +748,7 @@ pub fn write_token_file(dir: &std::path::Path, rt: &str, requested: &str) {
         refresh_token: Secret::new(rt),
         obtained_at: "2026-08-25T13:49:05.113000Z".into(),
         obtained_by: "device_code".into(),
+        rotated_from: None,
     };
     store::save_atomic(dir, &f, None, SaveMode::Login).unwrap();
 }
@@ -854,7 +855,10 @@ fn build_harness_inner(extra: &[(&str, &str)], endpoint_scope: &str, boot: Boot)
         &cfg.authority(),
         &requested,
         clock.clone(),
-        GrantLog::Silent,
+        match boot {
+            Boot::Grant(_) | Boot::Refresh => ProviderMode::Frozen,
+            Boot::Unsigned | Boot::FollowSigned => ProviderMode::Follow,
+        },
     ));
     let boot_grant = match boot {
         Boot::Grant(g) => Some(g),

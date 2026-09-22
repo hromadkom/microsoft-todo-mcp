@@ -293,10 +293,10 @@ impl Grant {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantLog {
+pub enum ProviderMode {
     Frozen,
     Follow,
-    Silent,
+    OneShot,
 }
 
 pub fn keeps_serving_without_token(e: &AuthError) -> bool {
@@ -478,7 +478,6 @@ enum FailureKind {
 
 #[derive(Clone)]
 struct RefreshFailure {
-    obtained_at: String,
     until: DateTime<Utc>,
     error: FailureKind,
 }
@@ -505,10 +504,13 @@ struct ProviderState {
     refreshes: u64,
     last_failure: Option<RefreshFailure>,
     file_seen: FileSeen,
+    epoch: u64,
 }
 
 /// Refresh proactively this long before the access token expires.
 const REFRESH_SKEW: ChronoDuration = ChronoDuration::seconds(300);
+/// Retry a failed refresh at most once per this interval; file observation
+/// clears the failure when a newer token file lands.
 const REFRESH_FAILURE_BACKOFF: ChronoDuration = ChronoDuration::seconds(30);
 
 pub struct TokenProvider {
@@ -518,7 +520,7 @@ pub struct TokenProvider {
     authority: String,
     requested_scope: String,
     clock: Arc<dyn Clock>,
-    mode: GrantLog,
+    mode: ProviderMode,
     state: Mutex<ProviderState>,
 }
 
@@ -538,6 +540,7 @@ pub struct TokenStatus {
     pub expires_at: Option<DateTime<Utc>>,
     pub obtained_at: Option<String>,
     pub refreshes: u64,
+    pub file_present: bool,
 }
 
 impl TokenProvider {
@@ -548,7 +551,7 @@ impl TokenProvider {
         authority: &str,
         requested_scope: &str,
         clock: Arc<dyn Clock>,
-        mode: GrantLog,
+        mode: ProviderMode,
     ) -> Self {
         Self {
             endpoint: Box::new(endpoint),
@@ -591,6 +594,7 @@ impl TokenProvider {
     }
 
     fn reset_state_for_file(&self, st: &mut ProviderState, seen: FileSeen) {
+        st.epoch = st.epoch.wrapping_add(1);
         st.cached = None;
         st.live_scope = None;
         st.live_grant = None;
@@ -610,6 +614,7 @@ impl TokenProvider {
             if seen != FileSeen::Absent
                 && let Ok(file) = store::load(&self.dir)
                 && file.obtained_by == "refresh"
+                && file.rotated_from.as_deref() == st.obtained_at.as_deref()
                 && file.client_id == self.client_id
                 && file.requested_scope == self.requested_scope
                 && Some(file.granted_scope.as_str()) == st.live_scope.as_deref()
@@ -650,17 +655,6 @@ impl TokenProvider {
         let mut base = store::load(&self.dir)?;
         for _attempt in 0..2 {
             self.check_file(&base)?;
-            if let Some(failure) = &st.last_failure
-                && failure.obtained_at == base.obtained_at
-                && now < failure.until
-            {
-                if let Some(c) = &st.cached
-                    && now < c.expires_at
-                {
-                    return Ok((c.token.clone(), st.live_grant.unwrap_or(Grant::None)));
-                }
-                return Err(failure.error.to_auth_error());
-            }
             let rt = base.refresh_token.clone();
             let outcome = self
                 .endpoint
@@ -693,7 +687,6 @@ impl TokenProvider {
                         }
                     }
                     st.last_failure = Some(RefreshFailure {
-                        obtained_at: base.obtained_at.clone(),
                         until: self.clock.now() + REFRESH_FAILURE_BACKOFF,
                         error: FailureKind::Entra(f.clone()),
                     });
@@ -707,7 +700,6 @@ impl TokenProvider {
                 }
                 Err(AuthError::Transport(s)) => {
                     st.last_failure = Some(RefreshFailure {
-                        obtained_at: base.obtained_at.clone(),
                         until: self.clock.now() + REFRESH_FAILURE_BACKOFF,
                         error: FailureKind::Transport(s.clone()),
                     });
@@ -734,6 +726,7 @@ impl TokenProvider {
                 refresh_token: success.refresh_token.clone().unwrap_or_else(|| rt.clone()),
                 obtained_at: store::format_instant(self.clock.now()),
                 obtained_by: "refresh".to_string(),
+                rotated_from: None,
             };
             match store::save_atomic(&self.dir, &new_file, Some(&base), SaveMode::Refresh)? {
                 SaveOutcome::Wrote(seen) => {
@@ -754,22 +747,16 @@ impl TokenProvider {
                     }
                     st.last_failure = None;
                     st.file_seen = seen;
-                    let scope_warning = (self.mode != GrantLog::Silent
+                    let scope_warning = (self.mode != ProviderMode::OneShot
                         && prev_scope.as_deref() != Some(granted.as_str()))
                     .then(|| audit_scope(&granted, &self.requested_scope).warning())
                     .flatten();
                     let grant_transition = match self.mode {
-                        GrantLog::Frozen
-                            if st.initial_grant.is_some() && st.initial_grant != Some(grant) =>
-                        {
-                            Some((
-                                "frozen",
-                                st.initial_grant.map(Grant::as_str),
-                                grant.as_str(),
-                            ))
+                        ProviderMode::Frozen if st.initial_grant != Some(grant) => {
+                            Some((true, st.initial_grant.map(Grant::as_str), grant.as_str()))
                         }
-                        GrantLog::Follow if prev_grant != Some(grant) => {
-                            Some(("follow", prev_grant.map(Grant::as_str), grant.as_str()))
+                        ProviderMode::Follow if prev_grant != Some(grant) => {
+                            Some((false, prev_grant.map(Grant::as_str), grant.as_str()))
                         }
                         _ => None,
                     };
@@ -778,9 +765,9 @@ impl TokenProvider {
                     if let Some(w) = scope_warning {
                         logger::warn(&w, &[]);
                     }
-                    if let Some((kind, was, now)) = grant_transition {
-                        match kind {
-                            "frozen" => logger::warn(
+                    if let Some((frozen, was, now)) = grant_transition {
+                        if frozen {
+                            logger::warn(
                                 &format!(
                                     "granted scope changed since startup; the tool list is frozen until restart. {RESTART_HINT}"
                                 ),
@@ -788,15 +775,15 @@ impl TokenProvider {
                                     ("was", serde_json::json!(was)),
                                     ("now", serde_json::json!(now)),
                                 ],
-                            ),
-                            "follow" => logger::info(
+                            );
+                        } else {
+                            logger::info(
                                 "granted scope changed",
                                 &[
                                     ("was", serde_json::json!(was)),
                                     ("now", serde_json::json!(now)),
                                 ],
-                            ),
-                            _ => {}
+                            );
                         }
                     }
                     return Ok((access_token, grant));
@@ -805,6 +792,9 @@ impl TokenProvider {
                     // A `login` landed while we were on the network. Discard our
                     // freshly minted token and keep the user's live chain.
                     logger::info("adopted a newer token.json written by login", &[]);
+                    if disk.obtained_by != "refresh" {
+                        st.epoch = st.epoch.wrapping_add(1);
+                    }
                     base = *disk;
                 }
             }
@@ -833,7 +823,16 @@ impl TokenProvider {
             expires_at: st.cached.as_ref().map(|c| c.expires_at),
             obtained_at: st.obtained_at.clone(),
             refreshes: st.refreshes,
+            file_present: match &st.file_seen {
+                FileSeen::Present { .. } => true,
+                FileSeen::Absent => false,
+                FileSeen::Unknown => matches!(store::observe(&self.dir), FileSeen::Present { .. }),
+            },
         }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).epoch
     }
 
     /// The grant the tool list was built from in default mode; in

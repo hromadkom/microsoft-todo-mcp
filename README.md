@@ -16,7 +16,7 @@ nothing else.
 >
 > | | |
 > |---|---|
-> | **Test suite** | 217 tests (114 unit, 103 integration) against a hand-rolled fixture Entra/Graph server. Green under the host time zone and under `TZ=Pacific/Kiritimati`, and inside `docker build --target test .` |
+> | **Test suite** | 219 tests (114 unit, 105 integration) against a hand-rolled fixture Entra/Graph server. Green under the host time zone and under `TZ=Pacific/Kiritimati`, and inside `docker build --target test .` |
 > | **Release image** | Built for `linux/amd64` and `linux/arm64` through the size gate, and checked on macOS arm64 Docker Desktop: user `65534:65534`, `/data` volume, healthcheck, no shell. A compose run with a fake client ID showed a fresh named volume's `/data` owned `65534:65534` mode `0700` (Docker Desktop keeps named volumes on ext4 inside its Linux VM; only bind mounts go through VirtioFS), and the `Restarting (3)` refusal without a sign-in |
 > | **Linux** | CI's `Release image` job asserts that first-mount ownership again on the amd64 image on a native Linux engine, and is the only evidence for `docker stop` during boot exiting 0 within 2 s (as PID 1, no init). Stopping a running server, and its drain, are tested on the host by `tests/shutdown.rs` |
 > | **Never done** | A run against a real Microsoft account. The live-Graph assumptions — `$batch` on `/me/todo/*`, whether `null` clears a due date, which Windows zone names a date write accepts, the exact scopes Microsoft grants — are still assumptions. [CHANGELOG.md](CHANGELOG.md) lists them all |
@@ -162,8 +162,8 @@ use Compose's `condition: service_healthy`. This follow mode uses the configured
 scope ceiling, notices later login, logout, dead-token deletion, and account
 switches on the next tool call, resets token state and task cache, and follows a
 changed live grant without a restart. A `login` file (`obtained_by: "device_code"`)
-or a changed scope resets state; a refresh rotation of the same chain is adopted
-silently. It reports `auth_required`, `auth_failed`,
+or a changed scope resets state; a refresh rotation that names its source via
+`rotated_from` is adopted silently. It reports `auth_required`, `auth_failed`,
 or the transport error until the missing token, Microsoft refusal, or Entra
 outage is fixed.
 
@@ -248,7 +248,7 @@ and every problem found is reported at once.
 | `TODO_MCP_CLIENT_SECRET` | — | must be unset | Any value is a startup refusal: this is a public client and never sends a secret. |
 | `TODO_MCP_TZ` | `UTC` (with a warning) | an IANA name, case-insensitive | "Overdue" and "due today" are undefined without it. Set it to the zone Outlook → Settings → Language and time shows. Any IANA name works for reading, but a **dated write** needs a zone Graph can map to a Windows time-zone name: `doctor` shows it as "Windows name for writes", and a write in a zone without one is refused with a nearby zone suggested. Tools also take a per-call `timezone` argument. |
 | `TODO_MCP_SCOPE` | `Tasks.ReadWrite` | `Tasks.ReadWrite` or `Tasks.Read` | A **ceiling**: with `Tasks.Read` the five write tools stay absent even if Microsoft grants `Tasks.ReadWrite`. The stored refresh token is read-only only if the app registration grants just `Tasks.Read`; otherwise `login`, `serve` and `doctor` warn that it can write your tasks. Changing it requires a new `login`. |
-| `TODO_MCP_START_WITHOUT_TOKEN` | `0` | `1`/`0` (also `true`/`false`/`yes`/`no`) | With `1`, the mode is follow mode whether or not the boot refresh succeeds: `/healthz` is 200, the tool list is the `TODO_MCP_SCOPE` ceiling, and dispatch enforces the live grant. Every tool call stats `token.json`; a changed or vanished file from login, logout, dead-token deletion, or account switching resets token state and task cache, while a same-chain refresh rotation is adopted silently. Missing tokens answer `auth_required`, Microsoft refusals answer `auth_failed`, and unreachable Entra returns the transport error until fixed. Refresh failures retry at most every 30 seconds for the same `token.json` but never hide a still-valid access token, including after a non-deleting Entra refusal; a new `login` retries immediately. `todo_account_status` with `check_connectivity:false` touches no network. An unusable `token.json`, refused grant, configuration, data-directory or bind failure still exits. |
+| `TODO_MCP_START_WITHOUT_TOKEN` | `0` | `1`/`0` (also `true`/`false`/`yes`/`no`) | With `1`, the mode is follow mode whether or not the boot refresh succeeds: `/healthz` is 200, the tool list is the `TODO_MCP_SCOPE` ceiling, and dispatch enforces the live grant. Every tool call stats `token.json`; a changed or vanished file from login, logout, dead-token deletion, or account switching resets token state and task cache, while a same-chain refresh rotation whose `rotated_from` names the prior file is adopted silently. Missing tokens answer `auth_required`, Microsoft refusals answer `auth_failed`, and unreachable Entra returns the transport error until fixed. Refresh failures retry at most every 30 seconds for the same `token.json` but never hide a still-valid access token, including after a non-deleting Entra refusal; a new `login` retries immediately. `todo_account_status` with `check_connectivity:false` touches no network. An unusable `token.json`, refused grant, configuration, data-directory or bind failure still exits. |
 | `TODO_MCP_TENANT` | `common` | a tenant GUID, a verified domain, `organizations` or `consumers` | For a single-tenant app registration (AADSTS50194). |
 | `TODO_MCP_BIND` | `0.0.0.0:8591` | `<ip>:<port>` | Listens on every interface, outside a container too. In the container the compose port mapping (`127.0.0.1:8591`) decides reachability; on a host run set `127.0.0.1:8591`. |
 | `TODO_MCP_DATA_DIR` | `/data` | an absolute path | Created `0700` if missing; a looser mode is a warning. Holds `token.json` (0600), `bearer.token` (0600 when generated), `.token.lock` (0600, the lock every read and write of `token.json` takes) and short-lived `token.json.tmp.*` files. |
@@ -310,8 +310,9 @@ The data directory holds two unrelated credentials, and `logout` touches only on
 
 A running `serve` notices a changed or vanished `token.json` on the next tool call.
 Login and logout replacements reset its token state and task cache, while a same-chain
-refresh rotation (including one written by `doctor`) is adopted silently without
-discarding the valid access token or warm task cache. It no longer uses a signed-out
+refresh rotation (including one written by `doctor`) whose `rotated_from` names
+the prior file is adopted silently without discarding the valid access token or
+warm task cache. It no longer uses a signed-out
 account.
 Its next refresh finds no `token.json` and never writes one back, even if that refresh
 was already under way when you ran `logout`, and it will not start again (exit 3)

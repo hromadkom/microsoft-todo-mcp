@@ -203,24 +203,88 @@ fn follow_mode_account_switch_resets_cache_before_refetch() {
 }
 
 #[test]
+fn provider_noticed_replacement_resets_cache_on_next_dispatch() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+    let first = h.call("todo_lists", json!({}));
+    assert!(first.get("isError").is_none(), "{first}");
+    let before = h.graph_requests();
+    let mut replacement = store::load(&h.dir).expect("token");
+    replacement.refresh_token = Secret::new("RT-REPLACED");
+    replacement.obtained_at = "2026-08-25T13:50:05.113000Z".into();
+    replacement.obtained_by = "device_code".into();
+    store::save_atomic(&h.dir, &replacement, None, SaveMode::Login).expect("replacement");
+
+    h.state
+        .graph
+        .tokens()
+        .access_token()
+        .expect("notice replacement");
+    let second = h.call("todo_lists", json!({}));
+    assert!(second.get("isError").is_none(), "{second}");
+    assert!(h.graph_requests() > before, "cache was not reset: {second}");
+}
+
+#[test]
 fn follow_mode_refresh_rotation_keeps_cache_and_token_state() {
     let h = harness_follow_signed(&[], RW_SCOPE);
     h.fx.add_list("Tasks", Some("defaultList"));
     let first = h.call("todo_lists", json!({}));
     assert!(first.get("isError").is_none(), "{first}");
     let before = h.graph_requests();
-    let mut rotation = store::load(&h.dir).expect("token");
+    let base = store::load(&h.dir).expect("token");
+    let mut rotation = base.clone();
+    let previous_obtained_at = rotation.obtained_at.clone();
     rotation.obtained_at = "2026-08-25T13:50:05.113000Z".into();
     rotation.obtained_by = "refresh".into();
-    store::save_atomic(&h.dir, &rotation, None, SaveMode::Login).expect("rotate");
+    rotation.rotated_from = Some(previous_obtained_at);
+    store::save_atomic(&h.dir, &rotation, Some(&base), SaveMode::Refresh).expect("rotate");
     let second = h.call("todo_lists", json!({}));
     assert!(second.get("isError").is_none(), "{second}");
     assert_eq!(h.graph_requests(), before, "rotation reset the warm cache");
 }
 
 #[test]
+fn refresh_shape_from_the_wrong_chain_resets_cache() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+    let first = h.call("todo_lists", json!({}));
+    assert!(first.get("isError").is_none(), "{first}");
+    let before = h.graph_requests();
+
+    let mut login = store::load(&h.dir).expect("token");
+    let login_obtained_at = "2026-08-25T13:50:05.113000Z".to_string();
+    login.obtained_at = login_obtained_at.clone();
+    login.obtained_by = "device_code".into();
+    login.refresh_token = Secret::new("RT-LOGIN");
+    store::save_atomic(&h.dir, &login, None, SaveMode::Login).expect("login");
+    let mut rotation = login;
+    rotation.obtained_at = "2026-08-25T13:50:06.113000Z".into();
+    rotation.obtained_by = "refresh".into();
+    rotation.rotated_from = Some(login_obtained_at);
+    let body = serde_json::to_vec_pretty(&rotation).expect("token JSON");
+    std::fs::write(h.dir.join("token.json"), body).expect("rotation");
+
+    let second = h.call("todo_lists", json!({}));
+    assert!(second.get("isError").is_none(), "{second}");
+    assert!(
+        h.graph_requests() > before,
+        "wrong-chain rotation kept cache"
+    );
+}
+
+#[test]
 fn frozen_mode_logout_keeps_boot_grant_but_disables_writes() {
-    let h = harness(&[]);
+    let h = harness_booted(&[], RW_SCOPE);
+    let before = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        before["structuredContent"]["token"]["present"], true,
+        "{before}"
+    );
+    assert_eq!(
+        before["structuredContent"]["write_tools_enabled"], true,
+        "{before}"
+    );
     std::fs::remove_file(h.dir.join("token.json")).expect("logout");
     let status = h.call("todo_account_status", json!({}));
     assert_eq!(
@@ -721,7 +785,7 @@ fn get_task_returns_full_fidelity_in_two_requests_when_warm() {
 
 #[test]
 fn account_status_makes_no_me_call_and_reports_the_grant() {
-    let h = harness(&[]);
+    let h = harness_booted(&[], RW_SCOPE);
     let r = h.ok("todo_account_status", json!({}));
     assert_eq!(r["account_id"], "default");
     assert_eq!(r["identity"], "not requested (no openid scope)");
@@ -731,7 +795,7 @@ fn account_status_makes_no_me_call_and_reports_the_grant() {
         login.contains("`docker compose run --rm todo-mcp login`"),
         "{r}"
     );
-    assert_eq!(r["write_tools_enabled"], false);
+    assert_eq!(r["write_tools_enabled"], true);
     assert_eq!(r["restart_required"], false);
     assert_eq!(h.graph_requests(), 0);
     let r = h.ok("todo_account_status", json!({ "check_connectivity": true }));

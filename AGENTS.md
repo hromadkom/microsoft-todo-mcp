@@ -193,9 +193,9 @@ hand-rolls a fixture Entra/Graph server on `tiny_http` (already a dependency), s
    log-hygiene parent asserts the child's stdout says `1 passed`, and the shutdown
    tests wait for the child's own log lines before signalling it.
 
-**217 tests per run: 114 unit** (in the lib; `main.rs` has none) **and 103
+**219 tests per run: 114 unit** (in the lib; `main.rs` has none) **and 105
 integration** — cli_smoke 10, graph_client 10, http_auth 2, shutdown 8 (one is the
-`child_process_entry` body, a no-op outside the child), token_store 17, tools_read 32,
+`child_process_entry` body, a no-op outside the child), token_store 17, tools_read 34,
 tools_write 24 — and 0 doctests. The count is the same under the host zone, under
 `TZ=Pacific/Kiritimati` and inside `docker build --target test .`.
 
@@ -336,7 +336,7 @@ and can print a task title.
 ## Status and where to start
 
 **Implemented and tested offline.** `auth/`, `graph/`, `domain/`, `cache.rs`,
-`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 217
+`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 219
 tests (see Tests) pass under the host zone, under `TZ=Pacific/Kiritimati` and inside
 `docker build --target test .`, with clippy `-D warnings`, `cargo fmt --check` and
 the ten gates green.
@@ -449,7 +449,8 @@ them):
   call stats `token.json`; login, logout, dead-token deletion, and account switching
   reset token state and task cache. Refresh failures back off for 30 seconds per
   token file without hiding a still-valid access token, including after a
-  non-deleting Entra refusal. Same-chain refresh rotations are adopted silently;
+  non-deleting Entra refusal. Same-chain refresh rotations are adopted silently
+  only when `rotated_from` names the prior file;
   grant/scope transition logging belongs to `TokenProvider`, not `ServerState`.
   No poller is needed because dispatch notices the on-disk file.
 - **The drain polls rather than nudging.** `run_http` calls `server.unblock()` once;

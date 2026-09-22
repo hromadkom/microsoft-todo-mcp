@@ -13,7 +13,7 @@ use crate::auth::device_code::{self, LoginIo};
 use crate::auth::entra::EntraClient;
 use crate::auth::store::{self, SaveMode, TokenFile};
 use crate::auth::{
-    AuthError, Grant, GrantLog, REVOKE_CONSENT_PATHS, TokenProvider, TokenSuccess, audit_scope,
+    AuthError, Grant, ProviderMode, REVOKE_CONSENT_PATHS, TokenProvider, TokenSuccess, audit_scope,
     effective_scope, forbidden_scope_message, grant_from_scope, keeps_serving_without_token,
     scope_short_names, stored_forbidden_scope_message, vet_grant,
 };
@@ -154,7 +154,7 @@ fn signal_refusal(name: &str, e: &std::io::Error) -> AppError {
     ))
 }
 
-fn token_provider(cfg: &Config, mode: GrantLog) -> TokenProvider {
+fn token_provider(cfg: &Config, mode: ProviderMode) -> TokenProvider {
     let entra = EntraClient::new(&cfg.authority(), &cfg.client_id, cfg.http_timeout_ms);
     TokenProvider::new(
         entra,
@@ -184,9 +184,9 @@ pub fn serve() -> Result<i32, AppError> {
 
     // The opt-in flag selects follow mode even when the boot refresh succeeds.
     let mode = if cfg.start_without_token {
-        GrantLog::Follow
+        ProviderMode::Follow
     } else {
-        GrantLog::Frozen
+        ProviderMode::Frozen
     };
     let tokens = Arc::new(token_provider(&cfg, mode));
     let boot = match tokens.access_token() {
@@ -381,6 +381,7 @@ pub fn finish_login(
         refresh_token: rt,
         obtained_at: store::format_instant(obtained_at),
         obtained_by: "device_code".into(),
+        rotated_from: None,
     };
     store::save_atomic(&cfg.data_dir, &file, None, SaveMode::Login)
         .map_err(|e| AppError::TokenStore(e.to_string()))?;
@@ -658,7 +659,7 @@ pub fn doctor(verbose: bool) -> Result<i32, AppError> {
     {
         out::line("");
         out::line("microsoft graph");
-        let tokens = Arc::new(token_provider(&cfg, GrantLog::Silent));
+        let tokens = Arc::new(token_provider(&cfg, ProviderMode::OneShot));
         match tokens.access_token() {
             Ok(_) => {
                 let st = tokens.status();

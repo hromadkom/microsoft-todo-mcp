@@ -8,13 +8,14 @@
 //! across it).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use chrono_tz::Tz;
 use serde_json::{Value, json};
 
-use crate::auth::{FileChange, Grant};
+use crate::auth::Grant;
 use crate::cache::{Cache, truncate_bodies};
 use crate::clock::Clock;
 use crate::config::Config;
@@ -40,6 +41,7 @@ pub struct ServerState {
     /// when serving without a sign-in.
     pub tools: Value,
     boot_grant: Option<Grant>,
+    cache_epoch: AtomicU64,
     pub started: Instant,
     /// The effective zone (config or UTC).
     pub tz: Tz,
@@ -139,6 +141,7 @@ impl ServerState {
         let tools_grant = boot_grant.unwrap_or_else(|| Grant::ceiling(cfg.scope));
         let tools = tools::build_tools(tools_grant, tz.name());
         let cache = Cache::new(cfg.cache_ttl_seconds, cfg.cache_max_tasks);
+        let cache_epoch = graph.tokens().epoch();
         debug_assert_eq!(boot_grant.is_none(), cfg.start_without_token);
         Self {
             cfg,
@@ -148,6 +151,7 @@ impl ServerState {
             refill: Mutex::new(()),
             tools,
             boot_grant,
+            cache_epoch: AtomicU64::new(cache_epoch),
             started: Instant::now(),
             tz,
             warned_tzids: Mutex::new(HashSet::new()),
@@ -179,7 +183,9 @@ impl ServerState {
     }
 
     pub fn observe_token(&self) {
-        if self.graph.tokens().notice_token_file() == FileChange::Replaced {
+        self.graph.tokens().notice_token_file();
+        let epoch = self.graph.tokens().epoch();
+        if self.cache_epoch.swap(epoch, Ordering::AcqRel) != epoch {
             self.cache_write().reset_for_new_account();
             logger::info("token.json replaced on disk; task cache reset", &[]);
         }

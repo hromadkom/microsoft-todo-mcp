@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configured ceiling and dispatch follows the live grant. Every tool call stats
   `token.json`; login, logout, dead-token deletion, and account switches reset
   token state and task cache, while same-chain refresh rotations (including
-  `doctor` refreshes) are adopted silently. Failed refreshes, including
+  `doctor` refreshes) are adopted silently when `rotated_from` names the prior
+  file. Failed refreshes, including
   non-deleting Entra refusals, back off for 30 seconds per token file without
   hiding a still-valid access token, and account status without connectivity
   touches no network.

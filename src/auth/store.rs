@@ -32,7 +32,7 @@ pub enum FileSeen {
     Absent,
     Present {
         mtime: Option<SystemTime>,
-        len: Option<u64>,
+        len: u64,
     },
 }
 
@@ -40,7 +40,7 @@ pub fn observe(dir: &Path) -> FileSeen {
     match fs::metadata(dir.join(TOKEN_FILE)) {
         Ok(meta) => FileSeen::Present {
             mtime: meta.modified().ok(),
-            len: Some(meta.len()),
+            len: meta.len(),
         },
         Err(_) => FileSeen::Absent,
     }
@@ -60,6 +60,8 @@ pub struct TokenFile {
     pub obtained_at: String,
     /// `device_code` or `refresh`.
     pub obtained_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotated_from: Option<String>,
 }
 
 impl TokenFile {
@@ -218,13 +220,19 @@ pub fn save_atomic(
     }
 
     let tmp = dir.join(format!("token.json.tmp.{}.{}", std::process::id(), nanos()));
+    let mut file = new.clone();
+    file.rotated_from = if mode == SaveMode::Refresh {
+        base.map(|b| b.obtained_at.clone())
+    } else {
+        None
+    };
     {
         let mut f = OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
             .open(&tmp)?;
-        let body = serde_json::to_vec_pretty(new)
+        let body = serde_json::to_vec_pretty(&file)
             .map_err(|_| StoreError::Io(std::io::ErrorKind::InvalidData))?;
         f.write_all(&body)?;
         f.write_all(b"\n")?;
@@ -347,6 +355,7 @@ mod tests {
             refresh_token: Secret::new(rt),
             obtained_at: at.into(),
             obtained_by: "device_code".into(),
+            rotated_from: None,
         }
     }
 

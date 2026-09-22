@@ -934,7 +934,11 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
         eff.unwrap_or(Grant::None)
     };
     let restart_reason = state.restart_reason_for(ts.live_scope.is_some().then_some(ts.live_grant));
-    let write_enabled = eff == Some(Grant::ReadWrite) && ts.live_scope.is_some();
+    let write_enabled = if state.follows_logins() {
+        eff == Some(Grant::ReadWrite) && ts.live_scope.is_some()
+    } else {
+        state.boot_grant() == Some(Grant::ReadWrite) && ts.file_present
+    };
     let widened = !write_enabled && live == Grant::ReadWrite;
     let stats = state.cache_read().stats(std::time::Instant::now());
     let gs = state.graph.stats();
@@ -957,7 +961,7 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
         "restart_required": restart_reason.is_some(),
         "restart_reason": restart_reason,
         "token": {
-            "present": ts.live_scope.is_some(),
+            "present": ts.file_present,
             "access_token_expires_at": ts.expires_at.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
             "refresh_token_obtained_at": ts.obtained_at,
             "refreshes": ts.refreshes,

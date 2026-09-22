@@ -75,7 +75,8 @@ Consequences:
 - Every tool call stats `token.json` in both modes. A changed or vanished file from a
   later login, logout, dead-token deletion, or account switch resets token state and
   the task cache; a same-chain refresh rotation, including one written by `doctor`, is
-  adopted silently, and follow mode picks up the live grant without a restart. A
+  adopted silently only when its `rotated_from` names the prior file, and follow mode
+  picks up the live grant without a restart. A
   `login` file (`obtained_by: "device_code"`) or a changed scope is a replacement
   and resets state. A transient refresh failure, including a non-deleting Entra refusal, is retried at
   most every 30 seconds for the same `token.json`, and never hides a still-valid
