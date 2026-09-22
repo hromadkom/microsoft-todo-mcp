@@ -328,7 +328,6 @@ pub fn delete_if_unchanged(dir: &Path, base: &TokenFile) -> Result<Option<FileSe
 
 /// Mode bits of `token.json`, for `doctor`.
 pub fn token_file_mode(dir: &Path) -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
     fs::metadata(dir.join(TOKEN_FILE))
         .ok()
         .map(|m| m.mode() & 0o7777)
