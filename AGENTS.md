@@ -114,7 +114,12 @@ leaves, importing no crate module: clock, errors, logger, mcp, sem
   forbids `with_base`.
 - **No user content in a log line.** stderr is persisted by the compose `json-file`
   driver. No `logger::` call may carry a task title, body, category, checklist item,
-  list name or a Graph `error.message`; name a list with `cache::log_ref("lst", &id)`.
+  list name, a Graph `error.message` or an Entra `error_description` (Microsoft's
+  sign-in text can quote the account name); name a list with
+  `cache::log_ref("lst", &id)`. A refused boot refresh is logged once, by `main`, from
+  `EntraFailure::log_error` (code, own summary and remediation, trace ids), never from
+  `render()` or `AppError::from_auth`, which keep the description for `login`/`doctor`
+  stdout and tool results. `cli/commands.rs::boot_error` is the chokepoint.
   The test is the re-exec pair in `tests/tools_read.rs`
   (`a_failed_batch_sub_request_logs_neither_the_list_name_nor_its_id` /
   `child_sync_with_a_failing_sub_request`). `doctor` printing list names and (with
@@ -193,7 +198,7 @@ hand-rolls a fixture Entra/Graph server on `tiny_http` (already a dependency), s
    log-hygiene parent asserts the child's stdout says `1 passed`, and the shutdown
    tests wait for the child's own log lines before signalling it.
 
-**221 tests per run: 115 unit** (in the lib; `main.rs` has none) **and 106
+**225 tests per run: 119 unit** (in the lib; `main.rs` has none) **and 106
 integration** — cli_smoke 10, graph_client 10, http_auth 2, shutdown 8 (one is the
 `child_process_entry` body, a no-op outside the child), token_store 17, tools_read 35,
 tools_write 24 — and 0 doctests. The count is the same under the host zone, under
@@ -336,7 +341,7 @@ and can print a task title.
 ## Status and where to start
 
 **Implemented and tested offline.** `auth/`, `graph/`, `domain/`, `cache.rs`,
-`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 221
+`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 225
 tests (see Tests) pass under the host zone, under `TZ=Pacific/Kiritimati` and inside
 `docker build --target test .`, with clippy `-D warnings`, `cargo fmt --check` and
 the ten gates green.
