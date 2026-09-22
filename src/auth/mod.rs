@@ -547,6 +547,15 @@ pub struct TokenProvider {
     state: Mutex<ProviderState>,
 }
 
+/// Whether `refresh_locked` logs a dead-token deletion itself. `Silent` is for
+/// the boot refresh only, whose refusal is logged once by the caller with the
+/// deletion note included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeletionLog {
+    Warn,
+    Silent,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileChange {
     Unchanged,
@@ -611,9 +620,23 @@ impl TokenProvider {
     }
 
     pub fn access_token_with_grant(&self) -> Result<(Secret, Grant), AuthError> {
+        self.token(DeletionLog::Warn)
+    }
+
+    /// `serve`'s boot refresh: `access_token`, except that a dead-token deletion
+    /// is not logged here. The refusal `main` (or follow-mode `serve`) logs from
+    /// `EntraFailure::log_error` already carries the deletion note, and a refused
+    /// boot is one persistent line (SECURITY.md). A refused runtime refresh is
+    /// logged by nothing else — it goes to the tool caller — so `access_token`
+    /// keeps the warning.
+    pub fn boot_token(&self) -> Result<Secret, AuthError> {
+        self.token(DeletionLog::Silent).map(|(token, _)| token)
+    }
+
+    fn token(&self, deletion_log: DeletionLog) -> Result<(Secret, Grant), AuthError> {
         self.notice_token_file();
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        self.refresh_locked(st, self.clock.now())
+        self.refresh_locked(st, self.clock.now(), deletion_log)
     }
 
     fn reset_state_for_file(&self, st: &mut ProviderState, seen: FileSeen) {
@@ -657,6 +680,7 @@ impl TokenProvider {
         &self,
         mut st: MutexGuard<'_, ProviderState>,
         now: DateTime<Utc>,
+        deletion_log: DeletionLog,
     ) -> Result<(Secret, Grant), AuthError> {
         if let Some(c) = &st.cached
             && now + REFRESH_SKEW < c.expires_at
@@ -694,10 +718,14 @@ impl TokenProvider {
                             Ok(Some(seen)) => {
                                 f.token_deleted = true;
                                 self.reset_state_for_file(&mut st, seen);
-                                logger::warn(
-                                    "deleted token.json: Microsoft says this token can never be used again",
-                                    &[("code", serde_json::json!(f.code_label()))],
-                                );
+                                // At boot the refusal `main` logs carries the
+                                // deletion note (`TOKEN_DELETED`) itself.
+                                if deletion_log == DeletionLog::Warn {
+                                    logger::warn(
+                                        "deleted token.json: Microsoft says this token can never be used again",
+                                        &[("code", serde_json::json!(f.code_label()))],
+                                    );
+                                }
                             }
                             Ok(None) => {}
                             Err(e) => logger::warn(

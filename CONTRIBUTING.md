@@ -125,7 +125,10 @@ convention; read it before a non-trivial change. The load-bearing ones:
   category, checklist item, list name, a Graph `error.message` or an Entra
   `error_description` (it can quote the account name). Name a list with
   `cache::log_ref("lst", &id)`; log an Entra refusal through
-  `EntraFailure::log_error`, never `render()`.
+  `EntraFailure::log_error`, never `render()`. A refused boot refresh is one log
+  line: `serve` boots through `TokenProvider::boot_token`, which does not log a
+  dead-token deletion separately because that line's remediation already says
+  `token.json was deleted`. `access_token` keeps the warning for runtime refreshes.
 - **No host time zone.** Wall-clock reads go through the injected `Clock`.
   `domain/datetime.rs` is the only caller of `from_local_datetime`.
 - **No panics across the tool boundary.** A domain error is an `{ "isError": true }` tool
