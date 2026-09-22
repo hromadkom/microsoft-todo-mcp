@@ -81,9 +81,10 @@ leaves, importing no crate module: clock, errors, logger, mcp, sem
   server-controlled URL and we attach a bearer to it. Scheme must be `https`, host
   must be `graph.microsoft.com`.
 - **`/users/{id}/…` exists nowhere.** Only `/me`. Gate 1 enforces it.
-- **All filtering, sorting and searching is client-side.** Whether Graph silently
-  ignores `$filter` on `todoTask` or hard-errors is **UNVERIFIED; no live probe is
-  recorded yet (see Status)**. Client-side is the conservative choice either way.
+- **All filtering, sorting and searching is client-side.** Live (2026-09-22,
+  `docs/graph-probe.md`): Graph applies `$filter` on `status`/`importance` and
+  `$orderby` on `createdDateTime`, answers 400 to `$orderby=title` and silently
+  ignores `$search` — a mixed surface nothing documents, so client-side stays.
 - **`chrono` is built without `clock`.** That makes `chrono::Local` structurally
   unreachable (E0433), not merely lint-banned, and keeps `iana-time-zone` out of
   the tree (gate 6). Wall-clock reads go through the injected `Clock`. The only
@@ -204,8 +205,8 @@ hand-rolls a fixture Entra/Graph server on `tiny_http` (already a dependency), s
    filter typo: the log-hygiene parents assert the child's stdout says `1 passed`, and
    the shutdown tests wait for the child's own log lines before signalling it.
 
-**227 tests per run: 119 unit** (in the lib; `main.rs` has none) **and 108
-integration** — cli_smoke 10, graph_client 10, http_auth 2, shutdown 8 (one is the
+**229 tests per run: 119 unit** (in the lib; `main.rs` has none) **and 110
+integration** — cli_smoke 10, graph_client 12, http_auth 2, shutdown 8 (one is the
 `child_process_entry` body, a no-op outside the child), token_store 19, tools_read 35,
 tools_write 24 — and 0 doctests. The count is the same under the host zone, under
 `TZ=Pacific/Kiritimati` and inside `docker build --target test .`.
@@ -324,7 +325,8 @@ rebuilding an older tag. Repo variables `IMAGE_NAME`/`REGISTRY` and secrets
 - `docs/footprint.md` — the measured binary and image sizes, ELF type, the
   `SIZE_LIMIT` rule and the commands behind them.
 - `docs/design/` — the historical specs (see Project).
-- `docs/graph-probe.md` — does not exist yet; the live run creates it (see Status).
+- `docs/graph-probe.md` — the redacted log of the first live-account run
+  (2026-09-22, one work account). Every Graph claim in this file cites it.
 
 Two facts in `docs/app-registration.md` were verified against Learn and are worth not
 re-deriving: Microsoft's managed consent policy (**the default for a new tenant**)
@@ -347,7 +349,7 @@ and can print a task title.
 ## Status and where to start
 
 **Implemented and tested offline.** `auth/`, `graph/`, `domain/`, `cache.rs`,
-`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 227
+`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 229
 tests (see Tests) pass under the host zone, under `TZ=Pacific/Kiritimati` and inside
 `docker build --target test .`, with clippy `-D warnings`, `cargo fmt --check` and
 the ten gates green.
@@ -387,32 +389,48 @@ no size line, so pass `--no-cache-filter size --progress=plain`. The ~336 KB fig
 early notes was a macOS build of the scaffold with rustls, ureq, tiny_http and
 chrono-tz dead-stripped — not a baseline.
 
-**Never run against a live Microsoft account.** That is the next step, and it is where
-the design's UNVERIFIED items get settled. Run `login`, then `doctor`, then connect a
-client, and record what happens in `docs/graph-probe.md` under the probe-output
-redaction rule:
+**Run against a live Microsoft account once** (2026-09-22, one work-or-school
+account on a single-tenant registration; `docs/graph-probe.md` is the redacted log,
+issue #3 the checklist). What it settled, and the one thing each changed:
 
-- `$batch` against `/me/todo/*` — `server.rs::sync_lists` falls back to sequential
-  first pages on any 4xx from `$batch`, so a rejection degrades latency, not
-  correctness. Confirm which path a real mailbox takes.
-- `Prefer: outlook.timezone` on `/todo` — `graph::client::observe` records
-  `timezone_mode` from `Preference-Applied`; `todo_account_status` reports it.
-- Whether `null` clears `dueDateTime`/`startDateTime`/`recurrence` on PATCH
-  (probes F/G). `todo_update_tasks` reports `cleared[]` on a 2xx; it does **not**
-  yet re-read to confirm, so a silently ignored null would go unnoticed.
-- Whether the hand-written `ALIAS_FALLBACK` Windows names in
-  `domain/datetime.rs` are accepted on a date write (probe J). `UTC` is in that
-  table too — it is the default zone and CLDR maps it to `Etc/UTC`.
-- Which `protocolVersion` each client negotiates (record it in the README's Clients
-  section).
-- The exact granted `scope` string for a clean personal and a clean work account: any
-  `.All`? Which extras (`User.Read`, `openid`/`profile`/`email`) appear? `vet_grant`
-  refuses any granted `.All`, so a benign one would stop every first login.
-- A real tool call from the musl release image: the first TLS handshake on a 512 KiB
-  worker thread (`WORKER_STACK` in `http.rs`). Every smoke test so far stops before
-  the network.
-- Idle RSS (`docs/footprint.md`), `docker compose up` reaching `healthy`, and the
-  revoke-consent click paths in `docs/app-registration.md`.
+- `$batch` against `/me/todo/*` is **accepted** (200, sub-responses 200, out of
+  order, `Prefer` honoured inside sub-requests). The sequential fallback in
+  `server.rs::sync_lists` was never taken.
+- `Prefer: outlook.timezone` on `/todo` is **applied but never acknowledged**: no
+  `Preference-Applied` header on any response, while `dueDateTime.timeZone` comes
+  back in the requested zone. An unknown Windows name is a 400 `invalidRequest`.
+  `graph::client::observe` therefore settles `timezone_mode` from the first read
+  whose body carries a `timeZone`, not from the header; a header-only check said
+  `client_side` on a mailbox that honours the preference.
+- `null` on PATCH **clears** `dueDateTime`, `startDateTime`, `reminderDateTime` and
+  `recurrence`. Graph removes the start date and recurrence together with the due
+  date (documented in the tool description and README). One first
+  `clear_due_date` through the server read back untouched a second later and
+  cleared on the second try; cause unknown, tracked as issue #25.
+- Every `ALIAS_FALLBACK` name in `domain/datetime.rs`, `UTC` included, is
+  **accepted and interpreted** on a dated write (stored instant = local midnight in
+  the zone sent).
+- **With a `recurrence`, Graph ignores the `dueDateTime` sent** and derives due and
+  start from `range.startDate` (a daily pattern in a non-UTC zone lands one interval
+  later, and PATCHing the due of a recurring task advances it one occurrence
+  whatever the value). The create echo already shows the truth; issue #24 asks
+  whether the tools should do more.
+- Claude Code 2.1.278 negotiates **`2025-11-25`** and sends a `server/discover`
+  request first (answered `-32601`, tolerated). README's Clients table has it.
+- The granted scope on the work account was
+  `profile openid email Tasks.ReadWrite User.Read`: **no `.All`**, the portal's
+  default `User.Read` plus the OpenID trio, so the `Microsoft also granted` warning
+  is the normal first-run outcome. A clean **personal** account is still unrecorded.
+- The musl release image's first TLS handshake on a 512 KiB worker **works**
+  (about sixty tool calls, reads and writes, no panic). `up -d` with a real token
+  is `healthy` in 5.5 s (the `start_period` floor). Idle RSS is 3.6–8 MiB
+  (`docs/footprint.md`).
+- `$filter`/`$orderby` on `todoTask`: mixed (see Conventions). Client-side stays.
+
+**Still unverified:** the revoke-consent click paths in `docs/app-registration.md`
+(no browser session on either account type), a personal account's scope string,
+and a tool call issued by Claude Code itself against a signed-in server (only the
+handshake was captured; the calls went through `curl`).
 
 **Design deviations worth knowing** (each is deliberate; the specs do not describe
 them):

@@ -30,9 +30,10 @@ echo "gates:"
 # 1. Cross-user access is an absence, not a policy. SECURITY.md claims this.
 gate "no /users/{id} Graph path in src/" absent_in_code '/users/' src/
 
-# 2. Graph either ignores or hard-errors on these for todoTask; all filtering,
-#    sorting and searching is client-side. Live status: docs/graph-probe.md
-#    (not yet recorded).
+# 2. All filtering, sorting and searching is client-side. Live status
+#    (docs/graph-probe.md, 2026-09-22): Graph applies $filter on status and
+#    importance and $orderby on createdDateTime, answers 400 to $orderby=title
+#    and silently ignores $search — a mixed surface the client-side rule avoids.
 gate "no \$filter/\$orderby under src/graph/" absent_in_code '\$(filter|orderby)' src/graph/
 
 # 3. The Graph bearer is attached in exactly one place, so the nextLink origin

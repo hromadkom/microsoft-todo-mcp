@@ -157,21 +157,42 @@ impl GraphClient {
         if res.status == 429 {
             st.throttled_429 += 1;
         }
-        if st.timezone_mode.is_none() && req.method == Method::Get {
-            st.timezone_mode = Some(match res.header("preference-applied") {
-                Some(v) if v.contains("outlook.timezone") => "server_side",
-                _ => {
-                    if self.prefer_tz.is_some() {
-                        "client_side"
-                    } else {
-                        "unknown"
+        // Reads only: a GET, or the `$batch` POST that carries GET sub-requests.
+        // A create or update echoes the task in UTC (writes send no `Prefer`),
+        // so judging by its body would settle the wrong answer.
+        let is_read = req.method == Method::Get
+            || (req.method == Method::Post && req.url.ends_with("/$batch"));
+        if st.timezone_mode.is_none() && is_read {
+            // Graph honours `outlook.timezone` on /me/todo/* WITHOUT ever sending a
+            // `Preference-Applied` header (docs/graph-probe.md), so the header alone
+            // would settle "client_side" on every real mailbox. When it is absent,
+            // judge by the body: a dated field echoed in the requested zone means the
+            // preference was applied, one in another zone means it was not, and a
+            // body with no dated field leaves the question open for the next read.
+            let mode = if res
+                .header("preference-applied")
+                .is_some_and(|v| v.contains("outlook.timezone"))
+            {
+                Some("server_side")
+            } else {
+                match &self.prefer_tz {
+                    None => Some("unknown"),
+                    Some(tz) => {
+                        let zones = body_time_zones(&res.body);
+                        if zones.is_empty() {
+                            None
+                        } else if zones.iter().any(|z| z == tz) {
+                            Some("server_side")
+                        } else {
+                            Some("client_side")
+                        }
                     }
                 }
-            });
-            logger::info(
-                "graph timezone mode settled",
-                &[("mode", json!(st.timezone_mode))],
-            );
+            };
+            if let Some(mode) = mode {
+                st.timezone_mode = Some(mode);
+                logger::info("graph timezone mode settled", &[("mode", json!(mode))]);
+            }
         }
         if !(200..300).contains(&res.status) {
             let request_id = res.header("request-id").map(str::to_string);
@@ -337,4 +358,32 @@ fn map_err(e: ureq::Error) -> TransportFailure {
         ureq::Error::TooManyRedirects => TransportFailure::Other("redirect refused".into()),
         _ => TransportFailure::Other("network error".into()),
     }
+}
+
+/// Every `timeZone` value in a Graph JSON body, `$batch` sub-responses included.
+/// Used once per process, to settle the timezone mode; an unparsable body is
+/// simply no evidence.
+fn body_time_zones(body: &[u8]) -> Vec<String> {
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Object(m) => {
+                for (k, v) in m {
+                    if k == "timeZone"
+                        && let Some(s) = v.as_str()
+                    {
+                        out.push(s.to_string());
+                    } else {
+                        walk(v, out);
+                    }
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(v) = serde_json::from_slice::<Value>(body) {
+        walk(&v, &mut out);
+    }
+    out
 }
