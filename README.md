@@ -360,8 +360,8 @@ src/
 The outbound `Authorization` header is set only in `graph/client.rs`, and `http.rs`
 reads the inbound one; a build gate allows exactly those two files.
 
-The dependency graph is **67 packages** (`grep -c '^\[\[package\]\]' Cargo.lock`,
-which counts the root crate, so 66 dependencies). The obvious alternative — the `rmcp`
+The dependency graph is **69 packages** (`grep -c '^\[\[package\]\]' Cargo.lock`,
+which counts the root crate, so 68 dependencies). The obvious alternative — the `rmcp`
 SDK plus axum, tokio, reqwest and oauth2 — resolved to **243** by the same measure, in
 a scratch manifest measured 2026-08-26 that is not in the repo, because rmcp pulls
 chrono, schemars, futures and indexmap non-optionally, and pairing it with `oauth2`
