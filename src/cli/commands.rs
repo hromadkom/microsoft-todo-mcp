@@ -51,7 +51,7 @@ pub fn load_or_create_bearer(path: &Path) -> Result<String, AppError> {
         }
     }
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|_| AppError::Config("the system CSPRNG is unavailable".into()))?;
     let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     let mut f = std::fs::OpenOptions::new()

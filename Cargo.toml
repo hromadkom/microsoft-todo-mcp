@@ -54,9 +54,10 @@ signal-hook = { version = "0.4", default-features = false }
 # Constant-time bearer compare. Already in the tree via rustls, so marginal cost is 0.
 subtle = { version = "2.6", default-features = false }
 
-# CSPRNG for the auto-generated bearer token. Already compiled via ring, so a direct
-# dependency costs ~0 bytes and avoids a /dev/urandom code path that FROM scratch
-# may not provide.
+# CSPRNG for the auto-generated bearer token; avoids a /dev/urandom code path that
+# FROM scratch may not provide. ring 0.17 still pins getrandom 0.2, so the lockfile
+# carries both majors (plus r-efi, 0.4's UEFI shim) until ring moves to 0.4. The
+# deliberate cost is two extra packages in the lockfile.
 getrandom = "0.4"
 
 [features]

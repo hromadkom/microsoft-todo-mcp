@@ -208,7 +208,7 @@ impl GraphClient {
 /// (correlation ids and jitter are not secrets).
 fn seed() -> u64 {
     let mut b = [0u8; 8];
-    if getrandom::getrandom(&mut b).is_ok() {
+    if getrandom::fill(&mut b).is_ok() {
         u64::from_le_bytes(b) | 1
     } else {
         0x9E37_79B9_7F4A_7C15
