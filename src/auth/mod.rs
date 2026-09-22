@@ -15,16 +15,17 @@ pub mod store;
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
-use crate::errors::{AppError, LOGIN_HINT};
+use crate::config::ScopeChoice;
+use crate::errors::{AppError, LOGIN_HINT, RESTART_HINT};
 use crate::logger;
 use aadsts::Diagnosis;
-use store::{SaveMode, SaveOutcome, StoreError, TokenFile};
+use store::{FileSeen, SaveMode, SaveOutcome, StoreError, TokenFile};
 
 /// A string that must never reach a log line, a tool result, or stdout.
 /// `Debug`/`Display` print `<redacted len=N>`; `expose()` is the one way out.
@@ -282,6 +283,27 @@ impl Grant {
             Grant::None => "none",
         }
     }
+
+    pub fn ceiling(scope: ScopeChoice) -> Grant {
+        match scope {
+            ScopeChoice::ReadWrite => Grant::ReadWrite,
+            ScopeChoice::Read => Grant::ReadOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderMode {
+    Frozen,
+    Follow,
+    OneShot,
+}
+
+pub fn keeps_serving_without_token(e: &AuthError) -> bool {
+    matches!(
+        e,
+        AuthError::NotLoggedIn | AuthError::Transport(_) | AuthError::Entra(_)
+    )
 }
 
 /// Short name OR last URI segment, case-insensitive; `ReadWrite` first because
@@ -448,20 +470,48 @@ struct Cached {
     expires_at: DateTime<Utc>,
 }
 
+#[derive(Clone)]
+enum FailureKind {
+    Entra(Box<EntraFailure>),
+    Transport(String),
+}
+
+#[derive(Clone)]
+struct RefreshFailure {
+    until: DateTime<Utc>,
+    error: FailureKind,
+}
+
+impl FailureKind {
+    fn to_auth_error(&self) -> AuthError {
+        match self {
+            Self::Entra(f) => AuthError::Entra(f.clone()),
+            Self::Transport(s) => AuthError::Transport(s.clone()),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ProviderState {
     cached: Option<Cached>,
-    /// The grant the tool list was built from — frozen for the process.
+    /// The grant the tool list was built from in default mode. In
+    /// start-without-token mode the list is the TODO_MCP_SCOPE ceiling and
+    /// dispatch follows the live grant.
     initial_grant: Option<Grant>,
-    /// The grant observed on the most recent refresh.
-    live_grant: Option<Grant>,
     live_scope: Option<String>,
+    live_grant: Option<Grant>,
     obtained_at: Option<String>,
     refreshes: u64,
+    last_failure: Option<RefreshFailure>,
+    file_seen: FileSeen,
+    epoch: u64,
 }
 
 /// Refresh proactively this long before the access token expires.
 const REFRESH_SKEW: ChronoDuration = ChronoDuration::seconds(300);
+/// Retry a failed refresh at most once per this interval; file observation
+/// clears the failure when a newer token file lands.
+const REFRESH_FAILURE_BACKOFF: ChronoDuration = ChronoDuration::seconds(30);
 
 pub struct TokenProvider {
     endpoint: Box<dyn TokenEndpoint>,
@@ -470,7 +520,15 @@ pub struct TokenProvider {
     authority: String,
     requested_scope: String,
     clock: Arc<dyn Clock>,
+    mode: ProviderMode,
     state: Mutex<ProviderState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChange {
+    Unchanged,
+    Rotated,
+    Replaced,
 }
 
 /// A snapshot for `doctor` / `todo_account_status`. No token material.
@@ -482,8 +540,7 @@ pub struct TokenStatus {
     pub expires_at: Option<DateTime<Utc>>,
     pub obtained_at: Option<String>,
     pub refreshes: u64,
-    /// Set when the live grant differs from the one the tool list was built on.
-    pub restart_reason: Option<String>,
+    pub file_present: bool,
 }
 
 impl TokenProvider {
@@ -494,6 +551,7 @@ impl TokenProvider {
         authority: &str,
         requested_scope: &str,
         clock: Arc<dyn Clock>,
+        mode: ProviderMode,
     ) -> Self {
         Self {
             endpoint: Box::new(endpoint),
@@ -502,6 +560,7 @@ impl TokenProvider {
             authority: authority.to_string(),
             requested_scope: requested_scope.to_string(),
             clock,
+            mode,
             state: Mutex::new(ProviderState::default()),
         }
     }
@@ -525,12 +584,71 @@ impl TokenProvider {
     /// The ONLY thing `graph/` calls. Single-flight in process: the state mutex
     /// is held across the network redeem; the file lock is not (m1 §6).
     pub fn access_token(&self) -> Result<Secret, AuthError> {
+        self.access_token_with_grant().map(|(token, _)| token)
+    }
+
+    pub fn access_token_with_grant(&self) -> Result<(Secret, Grant), AuthError> {
+        self.notice_token_file();
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.refresh_locked(st, self.clock.now())
+    }
+
+    fn reset_state_for_file(&self, st: &mut ProviderState, seen: FileSeen) {
+        st.epoch = st.epoch.wrapping_add(1);
+        st.cached = None;
+        st.live_scope = None;
+        st.live_grant = None;
+        st.obtained_at = None;
+        st.last_failure = None;
+        st.file_seen = seen;
+    }
+
+    pub fn notice_token_file(&self) -> FileChange {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let now = self.clock.now();
+        let seen = store::observe(&self.dir);
+        if st.file_seen == FileSeen::Unknown {
+            st.file_seen = seen;
+            return FileChange::Unchanged;
+        }
+        if st.file_seen != seen {
+            if seen != FileSeen::Absent
+                && let Ok(file) = store::load(&self.dir)
+                && file.obtained_by == "refresh"
+                && file.rotated_from.as_deref() == st.obtained_at.as_deref()
+                && file.client_id == self.client_id
+                && file.requested_scope == self.requested_scope
+                && Some(file.granted_scope.as_str()) == st.live_scope.as_deref()
+            {
+                st.obtained_at = Some(file.obtained_at);
+                st.last_failure = None;
+                st.file_seen = seen;
+                return FileChange::Rotated;
+            }
+            self.reset_state_for_file(&mut st, seen);
+            return FileChange::Replaced;
+        }
+        FileChange::Unchanged
+    }
+
+    fn refresh_locked(
+        &self,
+        mut st: MutexGuard<'_, ProviderState>,
+        now: DateTime<Utc>,
+    ) -> Result<(Secret, Grant), AuthError> {
         if let Some(c) = &st.cached
             && now + REFRESH_SKEW < c.expires_at
         {
-            return Ok(c.token.clone());
+            return Ok((c.token.clone(), st.live_grant.unwrap_or(Grant::None)));
+        }
+        if let Some(failure) = &st.last_failure
+            && now < failure.until
+        {
+            if let Some(c) = &st.cached
+                && now < c.expires_at
+            {
+                return Ok((c.token.clone(), st.live_grant.unwrap_or(Grant::None)));
+            }
+            return Err(failure.error.to_auth_error());
         }
 
         // Bounded: one adoption at most, then we trust the disk.
@@ -550,14 +668,15 @@ impl TokenProvider {
                         // Ok(false) nothing is deleted and nothing is redeemed again;
                         // the next access_token() reloads whatever is on disk.
                         match store::delete_if_unchanged(&self.dir, &base) {
-                            Ok(true) => {
+                            Ok(Some(seen)) => {
                                 f.token_deleted = true;
+                                self.reset_state_for_file(&mut st, seen);
                                 logger::warn(
                                     "deleted token.json: Microsoft says this token can never be used again",
                                     &[("code", serde_json::json!(f.code_label()))],
                                 );
                             }
-                            Ok(false) => {}
+                            Ok(None) => {}
                             Err(e) => logger::warn(
                                 "could not delete token.json, which Microsoft says is dead",
                                 &[
@@ -567,7 +686,29 @@ impl TokenProvider {
                             ),
                         }
                     }
+                    st.last_failure = Some(RefreshFailure {
+                        until: self.clock.now() + REFRESH_FAILURE_BACKOFF,
+                        error: FailureKind::Entra(f.clone()),
+                    });
+                    if !f.token_deleted
+                        && let Some(c) = &st.cached
+                        && self.clock.now() < c.expires_at
+                    {
+                        return Ok((c.token.clone(), st.live_grant.unwrap_or(Grant::None)));
+                    }
                     return Err(AuthError::Entra(f));
+                }
+                Err(AuthError::Transport(s)) => {
+                    st.last_failure = Some(RefreshFailure {
+                        until: self.clock.now() + REFRESH_FAILURE_BACKOFF,
+                        error: FailureKind::Transport(s.clone()),
+                    });
+                    if let Some(c) = &st.cached
+                        && self.clock.now() < c.expires_at
+                    {
+                        return Ok((c.token.clone(), st.live_grant.unwrap_or(Grant::None)));
+                    }
+                    return Err(AuthError::Transport(s));
                 }
                 Err(e) => return Err(e),
             };
@@ -585,9 +726,12 @@ impl TokenProvider {
                 refresh_token: success.refresh_token.clone().unwrap_or_else(|| rt.clone()),
                 obtained_at: store::format_instant(self.clock.now()),
                 obtained_by: "refresh".to_string(),
+                rotated_from: None,
             };
             match store::save_atomic(&self.dir, &new_file, Some(&base), SaveMode::Refresh)? {
-                SaveOutcome::Wrote => {
+                SaveOutcome::Wrote(seen) => {
+                    let prev_grant = st.live_grant;
+                    let prev_scope = st.live_scope.clone();
                     let expires_at =
                         self.clock.now() + ChronoDuration::seconds(success.expires_in.max(0));
                     st.cached = Some(Cached {
@@ -596,28 +740,61 @@ impl TokenProvider {
                     });
                     st.refreshes += 1;
                     st.obtained_at = Some(new_file.obtained_at.clone());
-                    st.live_scope = Some(granted);
+                    st.live_scope = Some(granted.clone());
                     st.live_grant = Some(grant);
                     if st.initial_grant.is_none() {
                         st.initial_grant = Some(grant);
-                    } else if st.initial_grant != Some(grant) {
-                        logger::warn(
-                            "granted scope changed since startup; the tool list is frozen until restart",
-                            &[
-                                (
-                                    "was",
-                                    serde_json::json!(st.initial_grant.map(Grant::as_str)),
-                                ),
-                                ("now", serde_json::json!(grant.as_str())),
-                            ],
-                        );
                     }
-                    return Ok(success.access_token.clone());
+                    st.last_failure = None;
+                    st.file_seen = seen;
+                    let scope_warning = (self.mode != ProviderMode::OneShot
+                        && prev_scope.as_deref() != Some(granted.as_str()))
+                    .then(|| audit_scope(&granted, &self.requested_scope).warning())
+                    .flatten();
+                    let grant_transition = match self.mode {
+                        ProviderMode::Frozen if st.initial_grant != Some(grant) => {
+                            Some((true, st.initial_grant.map(Grant::as_str), grant.as_str()))
+                        }
+                        ProviderMode::Follow if prev_grant != Some(grant) => {
+                            Some((false, prev_grant.map(Grant::as_str), grant.as_str()))
+                        }
+                        _ => None,
+                    };
+                    let access_token = success.access_token.clone();
+                    drop(st);
+                    if let Some(w) = scope_warning {
+                        logger::warn(&w, &[]);
+                    }
+                    if let Some((frozen, was, now)) = grant_transition {
+                        if frozen {
+                            logger::warn(
+                                &format!(
+                                    "granted scope changed since startup; the tool list is frozen until restart. {RESTART_HINT}"
+                                ),
+                                &[
+                                    ("was", serde_json::json!(was)),
+                                    ("now", serde_json::json!(now)),
+                                ],
+                            );
+                        } else {
+                            logger::info(
+                                "granted scope changed",
+                                &[
+                                    ("was", serde_json::json!(was)),
+                                    ("now", serde_json::json!(now)),
+                                ],
+                            );
+                        }
+                    }
+                    return Ok((access_token, grant));
                 }
                 SaveOutcome::Adopted(disk) => {
                     // A `login` landed while we were on the network. Discard our
                     // freshly minted token and keep the user's live chain.
                     logger::info("adopted a newer token.json written by login", &[]);
+                    if disk.obtained_by != "refresh" {
+                        st.epoch = st.epoch.wrapping_add(1);
+                    }
                     base = *disk;
                 }
             }
@@ -632,19 +809,13 @@ impl TokenProvider {
     pub fn invalidate(&self) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.cached = None;
+        st.last_failure = None;
     }
 
     pub fn status(&self) -> TokenStatus {
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let initial = st.initial_grant.unwrap_or(Grant::None);
         let live = st.live_grant.unwrap_or(initial);
-        let restart_reason = (st.initial_grant.is_some() && live != initial).then(|| {
-            format!(
-                "granted scope changed from {} to {} after startup",
-                initial.as_str(),
-                live.as_str()
-            )
-        });
         TokenStatus {
             initial_grant: initial,
             live_grant: live,
@@ -652,11 +823,21 @@ impl TokenProvider {
             expires_at: st.cached.as_ref().map(|c| c.expires_at),
             obtained_at: st.obtained_at.clone(),
             refreshes: st.refreshes,
-            restart_reason,
+            file_present: match &st.file_seen {
+                FileSeen::Present { .. } => true,
+                FileSeen::Absent => false,
+                FileSeen::Unknown => matches!(store::observe(&self.dir), FileSeen::Present { .. }),
+            },
         }
     }
 
-    /// The grant the tool list is built from. `None` before the first refresh.
+    pub fn epoch(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).epoch
+    }
+
+    /// The grant the tool list was built from in default mode; in
+    /// start-without-token mode the list is the TODO_MCP_SCOPE ceiling and
+    /// dispatch follows the live grant.
     pub fn initial_grant(&self) -> Option<Grant> {
         self.state
             .lock()
@@ -669,6 +850,36 @@ impl TokenProvider {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keep_serving_policy_only_tolerates_authentication_availability_failures() {
+        let entra = AuthError::Entra(Box::new(EntraFailure {
+            error: "invalid_grant".into(),
+            code: None,
+            codes: vec![],
+            description: "refused".into(),
+            trace_id: None,
+            correlation_id: None,
+            diagnosis: aadsts::diagnose(&[], "invalid_grant"),
+            token_deleted: false,
+        }));
+        let cases = [
+            (AuthError::NotLoggedIn, true),
+            (AuthError::Transport("offline".into()), true),
+            (entra, true),
+            (AuthError::Store(StoreError::Corrupt("test".into())), false),
+            (AuthError::WrongApp, false),
+            (AuthError::ScopeChanged, false),
+            (AuthError::NoTasksScope("offline_access".into()), false),
+            (
+                AuthError::ForbiddenScope(vec!["Tasks.Read.All".into()]),
+                false,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(keeps_serving_without_token(&error), expected, "{error}");
+        }
+    }
 
     #[test]
     fn secret_never_prints_itself() {

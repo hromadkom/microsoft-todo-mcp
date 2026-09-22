@@ -149,6 +149,15 @@ impl Cache {
         self.generation += 1;
     }
 
+    pub fn reset_for_new_account(&mut self) {
+        self.reset_preserving_mailbox_id();
+        self.mailbox_id = "mbx_pending".into();
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// The catalogue if fresh.
     pub fn catalogue(&self, now: Instant) -> Option<&Catalogue> {
         self.catalogue
@@ -445,6 +454,17 @@ mod tests {
         // No default list at all → mbx_unknown.
         c.put_catalogue(vec![list("L2", None)], t0);
         assert_eq!(c.mailbox_id, "mbx_unknown");
+    }
+
+    #[test]
+    fn reset_for_new_account_sets_pending_mailbox_and_bumps_generation() {
+        let mut c = Cache::new(120, 5000);
+        c.put_catalogue(vec![list("L1", Some("defaultList"))], Instant::now());
+        let generation = c.generation();
+        c.reset_for_new_account();
+        assert!(c.generation() > generation);
+        assert!(c.catalogue_any().is_none());
+        assert_eq!(c.mailbox_id, "mbx_pending");
     }
 
     #[test]

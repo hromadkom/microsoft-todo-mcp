@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in startup without a sign-in.** `TODO_MCP_START_WITHOUT_TOKEN=1` selects
+  follow mode whether or not the boot refresh succeeds. The tool list uses the
+  configured ceiling and dispatch follows the live grant. Every tool call stats
+  `token.json`; login, logout, dead-token deletion, and account switches reset
+  token state and task cache, while same-chain refresh rotations (including
+  `doctor` refreshes) are adopted silently when `rotated_from` names the prior
+  file. Failed refreshes, including
+  non-deleting Entra refusals, back off for 30 seconds per token file without
+  hiding a still-valid access token, and account status without connectivity
+  touches no network.
+  Missing tokens, Microsoft refusals and unreachable Entra keep the listener healthy
+  with cause-specific tool errors; corrupt token files and refused grants still
+  refuse startup.
+
 ## [0.1.0] - 2026-09-15
 
 First public release.

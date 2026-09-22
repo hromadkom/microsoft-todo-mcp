@@ -8,6 +8,7 @@
 //! across it).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
@@ -36,9 +37,11 @@ pub struct ServerState {
     pub cache: RwLock<Cache>,
     /// Single-flight for cold syncs. Held across HTTP by design.
     pub refill: Mutex<()>,
-    /// Frozen at construction from the granted scope.
+    /// Frozen at construction from the granted scope, or configured ceiling
+    /// when serving without a sign-in.
     pub tools: Value,
-    pub grant: Grant,
+    boot_grant: Option<Grant>,
+    cache_epoch: AtomicU64,
     pub started: Instant,
     /// The effective zone (config or UTC).
     pub tz: Tz,
@@ -128,10 +131,18 @@ pub struct SyncOutcome {
 type Known = HashMap<String, (Vec<Task>, bool)>;
 
 impl ServerState {
-    pub fn new(cfg: Config, graph: GraphClient, clock: Arc<dyn Clock>, grant: Grant) -> Self {
+    pub fn new(
+        cfg: Config,
+        graph: GraphClient,
+        clock: Arc<dyn Clock>,
+        boot_grant: Option<Grant>,
+    ) -> Self {
         let tz = cfg.effective_tz();
-        let tools = tools::build_tools(grant, tz.name());
+        let tools_grant = boot_grant.unwrap_or_else(|| Grant::ceiling(cfg.scope));
+        let tools = tools::build_tools(tools_grant, tz.name());
         let cache = Cache::new(cfg.cache_ttl_seconds, cfg.cache_max_tasks);
+        let cache_epoch = graph.tokens().epoch();
+        debug_assert_eq!(boot_grant.is_none(), cfg.start_without_token);
         Self {
             cfg,
             graph,
@@ -139,10 +150,44 @@ impl ServerState {
             cache: RwLock::new(cache),
             refill: Mutex::new(()),
             tools,
-            grant,
+            boot_grant,
+            cache_epoch: AtomicU64::new(cache_epoch),
             started: Instant::now(),
             tz,
             warned_tzids: Mutex::new(HashSet::new()),
+        }
+    }
+
+    pub fn boot_grant(&self) -> Option<Grant> {
+        self.boot_grant
+    }
+
+    pub fn follows_logins(&self) -> bool {
+        self.cfg.start_without_token
+    }
+
+    pub fn restart_reason_for(&self, live: Option<Grant>) -> Option<String> {
+        if self.follows_logins() {
+            return None;
+        }
+        let (Some(boot), Some(live)) = (self.boot_grant, live) else {
+            return None;
+        };
+        (boot != live).then(|| {
+            format!(
+                "granted scope changed from {} to {} after startup",
+                boot.as_str(),
+                live.as_str()
+            )
+        })
+    }
+
+    pub fn observe_token(&self) {
+        self.graph.tokens().notice_token_file();
+        let epoch = self.graph.tokens().epoch();
+        if self.cache_epoch.swap(epoch, Ordering::AcqRel) != epoch {
+            self.cache_write().reset_for_new_account();
+            logger::info("token.json replaced on disk; task cache reset", &[]);
         }
     }
 
@@ -212,10 +257,13 @@ impl ServerState {
                 return Ok(cat.lists.clone());
             }
         }
+        let generation = self.cache_read().generation();
         let (lists, _complete) = self.graph.list_lists(budget)?;
         let mut c = self.cache_write();
         c.misses += 1;
-        c.put_catalogue(lists.clone(), Instant::now());
+        if c.generation() == generation {
+            c.put_catalogue(lists.clone(), Instant::now());
+        }
         Ok(lists)
     }
 
@@ -242,10 +290,13 @@ impl ServerState {
                 return Ok((e.tasks.clone(), true));
             }
         }
+        let generation = self.cache_read().generation();
         let (tasks, complete) = self.graph.list_tasks(&list.id, budget)?;
         let mut c = self.cache_write();
         c.misses += 1;
-        c.put_list(&list.id, tasks.clone(), complete, Instant::now());
+        if c.generation() == generation {
+            c.put_list(&list.id, tasks.clone(), complete, Instant::now());
+        }
         Ok((tasks, complete))
     }
 
@@ -272,6 +323,7 @@ impl ServerState {
         mut tasks: Vec<Task>,
         complete: bool,
         miss: bool,
+        generation: u64,
     ) {
         truncate_bodies(&mut tasks);
         {
@@ -281,7 +333,7 @@ impl ServerState {
             }
             // TTL 0 stores nothing: skip the clone rather than hold every
             // fetched task twice for the length of the call.
-            if !c.ttl().is_zero() {
+            if c.generation() == generation && !c.ttl().is_zero() {
                 c.put_list(list_id, tasks.clone(), complete, Instant::now());
             }
         }
@@ -416,7 +468,7 @@ impl ServerState {
         let mut graph_failure: Option<AppError> = None;
 
         // Continuations to walk sequentially after the batched first pages.
-        let mut continuations: Vec<(TaskList, Vec<Task>, String)> = Vec::new();
+        let mut continuations: Vec<(TaskList, Vec<Task>, String, u64)> = Vec::new();
         let mut pending: Vec<TaskList> = ordered;
 
         'batches: while !pending.is_empty() {
@@ -429,6 +481,7 @@ impl ServerState {
                 break;
             }
             let chunk: Vec<TaskList> = pending.drain(..pending.len().min(BATCH_MAX)).collect();
+            let generation = self.cache_read().generation();
             let subs: Vec<BatchSub> = chunk
                 .iter()
                 .enumerate()
@@ -466,8 +519,10 @@ impl ServerState {
                             })
                             .unwrap_or_default();
                         match r.body.get("@odata.nextLink").and_then(Value::as_str) {
-                            Some(next) => continuations.push((l.clone(), tasks, next.to_string())),
-                            None => self.keep(&mut known, &l.id, tasks, true, true),
+                            Some(next) => {
+                                continuations.push((l.clone(), tasks, next.to_string(), generation))
+                            }
+                            None => self.keep(&mut known, &l.id, tasks, true, true, generation),
                         }
                     }
                 }
@@ -483,9 +538,10 @@ impl ServerState {
                             stopped = "sync_timeout";
                             break 'batches;
                         }
+                        let generation = self.cache_read().generation();
                         match self.graph.list_tasks(&l.id, budget) {
                             Ok((tasks, complete)) => {
-                                self.keep(&mut known, &l.id, tasks, complete, true);
+                                self.keep(&mut known, &l.id, tasks, complete, true, generation);
                             }
                             Err(AppError::Throttled { .. }) => {
                                 stopped = "throttled";
@@ -514,11 +570,12 @@ impl ServerState {
 
         // Walk continuations one list at a time; a list cut short keeps what
         // it has with complete: false.
-        for (l, mut tasks, next) in continuations {
+        for (l, mut tasks, next, generation) in continuations {
             if stopped != "complete" {
-                self.keep(&mut known, &l.id, tasks, false, false);
+                self.keep(&mut known, &l.id, tasks, false, false, generation);
                 continue;
             }
+            let generation = self.cache_read().generation();
             match self.graph.continue_collection(&next, budget) {
                 Ok((more, complete)) => {
                     tasks.extend(
@@ -534,16 +591,16 @@ impl ServerState {
                             "page_cap"
                         };
                     }
-                    self.keep(&mut known, &l.id, tasks, complete, true);
+                    self.keep(&mut known, &l.id, tasks, complete, true, generation);
                 }
                 Err(AppError::Throttled { .. }) => {
                     stopped = "throttled";
-                    self.keep(&mut known, &l.id, tasks, false, false);
+                    self.keep(&mut known, &l.id, tasks, false, false, generation);
                 }
                 Err(e) => {
                     graph_failure = Some(e);
                     stopped = "graph_error";
-                    self.keep(&mut known, &l.id, tasks, false, false);
+                    self.keep(&mut known, &l.id, tasks, false, false, generation);
                 }
             }
         }
