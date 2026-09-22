@@ -8,12 +8,394 @@ use std::time::Instant;
 use chrono::{Duration, TimeZone, Utc};
 use serde_json::{Value, json};
 
-use common::{Override, harness, harness_booted, pinned_now, seed_22_lists};
+use common::{
+    Override, harness, harness_booted, harness_follow_signed, harness_unsigned, pinned_now,
+    seed_22_lists, write_token_file,
+};
+use microsoft_todo_mcp::auth::store::{self, SaveMode};
+use microsoft_todo_mcp::auth::{Grant, Secret};
 use microsoft_todo_mcp::cache::log_ref;
+use microsoft_todo_mcp::errors::RESTART_HINT;
 use microsoft_todo_mcp::mcp::ToolProvider;
 
 const RW_SCOPE: &str = "https://graph.microsoft.com/Tasks.ReadWrite offline_access";
 const READ_SCOPE: &str = "https://graph.microsoft.com/Tasks.Read offline_access";
+
+#[test]
+fn an_unsigned_server_recovers_on_the_first_call_after_login() {
+    let h = harness_unsigned(&[], RW_SCOPE);
+    assert!(!h.dir.join("token.json").exists());
+
+    let lists = h.call("todo_lists", json!({}));
+    assert_eq!(lists["isError"], true, "{lists}");
+    assert!(
+        lists["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("auth_required"),
+        "{lists}"
+    );
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(status["structuredContent"]["grant"], "none", "{status}");
+    assert_eq!(
+        status["structuredContent"]["write_tools_enabled"], false,
+        "{status}"
+    );
+    assert_eq!(
+        status["structuredContent"]["token"]["present"], false,
+        "{status}"
+    );
+    let write = h.call("todo_create_tasks", json!({"tasks": [{"title": "x"}]}));
+    assert_eq!(write["isError"], true, "{write}");
+    assert!(
+        write["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("auth_required"),
+        "{write}"
+    );
+
+    write_token_file(&h.dir, "RT-OLD", RW_SCOPE);
+    let lists = h.call("todo_lists", json!({}));
+    assert!(lists.get("isError").is_none(), "{lists}");
+    assert_eq!(h.state.graph.tokens().status().live_grant, Grant::ReadWrite);
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["grant"], "Tasks.ReadWrite",
+        "{status}"
+    );
+    assert_eq!(
+        status["structuredContent"]["write_tools_enabled"], true,
+        "{status}"
+    );
+}
+
+#[test]
+fn an_unsigned_server_refuses_writes_after_a_narrower_grant_lands() {
+    let h = harness_unsigned(&[], READ_SCOPE);
+    write_token_file(&h.dir, "RT-OLD", RW_SCOPE);
+    let lists = h.call("todo_lists", json!({}));
+    assert!(lists.get("isError").is_none(), "{lists}");
+    let write = h.call("todo_create_tasks", json!({"tasks": [{"title": "x"}]}));
+    assert_eq!(write["isError"], true, "{write}");
+    let text = write["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("current Microsoft Graph grant is `Tasks.Read`"),
+        "{text}"
+    );
+    assert!(!text.contains(RESTART_HINT), "{text}");
+}
+
+#[test]
+fn an_unsigned_first_write_after_a_read_login_refuses_before_graph() {
+    let h = harness_unsigned(&[], RW_SCOPE);
+    write_token_file(&h.dir, "RT-OLD", RW_SCOPE);
+    let mut read_token = store::load(&h.dir).expect("token");
+    read_token.granted_scope = READ_SCOPE.into();
+    store::save_atomic(&h.dir, &read_token, None, SaveMode::Login).expect("narrow token");
+    *h.endpoint.scope.lock().unwrap() = Some(READ_SCOPE.to_string());
+    h.fx.add_list("Tasks", Some("defaultList"));
+    let write = h.call(
+        "todo_create_tasks",
+        json!({"list": "Tasks", "tasks": [{"title": "x"}]}),
+    );
+    assert_eq!(write["isError"], true, "{write}");
+    let text = write["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("current Microsoft Graph grant is `Tasks.Read`"),
+        "{text}"
+    );
+    assert_eq!(h.endpoint.calls(), 1);
+    assert_eq!(h.fx.count_matching("POST", "/tasks"), 0);
+}
+
+#[test]
+fn an_unsigned_read_ceiling_has_five_tools_and_refuses_writes_as_read_only() {
+    let h = harness_unsigned(&[("TODO_MCP_SCOPE", "Tasks.Read")], READ_SCOPE);
+    assert_eq!(h.state.list_tools().as_array().unwrap().len(), 5);
+
+    let write = h.call("todo_create_tasks", json!({"tasks": [{"title": "x"}]}));
+    assert_eq!(write["isError"], true, "{write}");
+    let text = write["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("TODO_MCP_SCOPE=Tasks.Read"), "{text}");
+    assert_eq!(h.graph_requests(), 0);
+
+    let lists = h.call("todo_lists", json!({}));
+    assert_eq!(lists["isError"], true, "{lists}");
+    assert!(
+        lists["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("auth_required"),
+        "{lists}"
+    );
+}
+
+#[test]
+fn an_unsigned_server_follows_a_widened_grant_without_restart() {
+    let h = harness_unsigned(&[], READ_SCOPE);
+    write_token_file(&h.dir, "RT-OLD", RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+
+    let first = h.call("todo_lists", json!({}));
+    assert!(first.get("isError").is_none(), "{first}");
+    assert_eq!(h.state.graph.tokens().status().live_grant, Grant::ReadOnly);
+
+    *h.endpoint.scope.lock().unwrap() = Some(RW_SCOPE.to_string());
+    write_token_file(&h.dir, "RT-NEW", RW_SCOPE);
+    let write = h.call(
+        "todo_create_tasks",
+        json!({"list": "Tasks", "tasks": [{"title": "x"}]}),
+    );
+    assert!(write.get("isError").is_none(), "{write}");
+    assert_eq!(h.endpoint.calls(), 2);
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["restart_required"], false,
+        "{status}"
+    );
+    assert_eq!(
+        status["structuredContent"]["grant"], "Tasks.ReadWrite",
+        "{status}"
+    );
+}
+
+#[test]
+fn follow_mode_logout_clears_status_and_requires_login() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    std::fs::remove_file(h.dir.join("token.json")).expect("logout");
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["token"]["present"], false,
+        "{status}"
+    );
+    assert_eq!(status["structuredContent"]["grant"], "none", "{status}");
+    assert_eq!(
+        status["structuredContent"]["write_tools_enabled"], false,
+        "{status}"
+    );
+    let lists = h.call("todo_lists", json!({}));
+    assert_eq!(lists["isError"], true, "{lists}");
+    assert!(
+        lists["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("auth_required"),
+        "{lists}"
+    );
+}
+
+#[test]
+fn follow_mode_account_switch_resets_cache_before_refetch() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+    let first = h.call("todo_lists", json!({}));
+    assert!(first.get("isError").is_none(), "{first}");
+    let before = h.graph_requests();
+    let mut replacement = store::load(&h.dir).expect("token");
+    replacement.refresh_token = Secret::new("RT-SWITCHED");
+    replacement.obtained_at = "2026-08-25T13:50:05.113000Z".into();
+    replacement.obtained_by = "device_code".into();
+    store::save_atomic(&h.dir, &replacement, None, SaveMode::Login).expect("switch account");
+    let second = h.call("todo_lists", json!({}));
+    assert!(second.get("isError").is_none(), "{second}");
+    assert!(h.graph_requests() > before, "cache was not reset: {second}");
+}
+
+#[test]
+fn provider_noticed_replacement_resets_cache_on_next_dispatch() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+    let first = h.call("todo_lists", json!({}));
+    assert!(first.get("isError").is_none(), "{first}");
+    let before = h.graph_requests();
+    let mut replacement = store::load(&h.dir).expect("token");
+    replacement.refresh_token = Secret::new("RT-REPLACED");
+    replacement.obtained_at = "2026-08-25T13:50:05.113000Z".into();
+    replacement.obtained_by = "device_code".into();
+    store::save_atomic(&h.dir, &replacement, None, SaveMode::Login).expect("replacement");
+
+    h.state
+        .graph
+        .tokens()
+        .access_token()
+        .expect("notice replacement");
+    let second = h.call("todo_lists", json!({}));
+    assert!(second.get("isError").is_none(), "{second}");
+    assert!(h.graph_requests() > before, "cache was not reset: {second}");
+}
+
+#[test]
+fn follow_mode_refresh_rotation_keeps_cache_and_token_state() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+    let first = h.call("todo_lists", json!({}));
+    assert!(first.get("isError").is_none(), "{first}");
+    let before = h.graph_requests();
+    let base = store::load(&h.dir).expect("token");
+    let mut rotation = base.clone();
+    rotation.obtained_at = "2026-08-25T13:50:05.113000Z".into();
+    rotation.obtained_by = "refresh".into();
+    store::save_atomic(&h.dir, &rotation, Some(&base), SaveMode::Refresh).expect("rotate");
+    let second = h.call("todo_lists", json!({}));
+    assert!(second.get("isError").is_none(), "{second}");
+    assert_eq!(h.graph_requests(), before, "rotation reset the warm cache");
+}
+
+#[test]
+fn follow_mode_status_reports_unknown_grant_after_login_until_next_graph_call() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+    let first = h.call("todo_lists", json!({}));
+    assert!(first.get("isError").is_none(), "{first}");
+
+    let mut replacement = store::load(&h.dir).expect("token");
+    replacement.obtained_at = "2026-08-25T13:50:05.113000Z".into();
+    replacement.obtained_by = "device_code".into();
+    replacement.refresh_token = Secret::new("RT-LOGIN");
+    store::save_atomic(&h.dir, &replacement, None, SaveMode::Login).expect("login");
+
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["token"]["present"], true,
+        "{status}"
+    );
+    assert_eq!(
+        status["structuredContent"]["write_tools_enabled"],
+        Value::Null,
+        "{status}"
+    );
+
+    let second = h.call("todo_lists", json!({}));
+    assert!(second.get("isError").is_none(), "{second}");
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["write_tools_enabled"], true,
+        "{status}"
+    );
+}
+
+#[test]
+fn refresh_shape_from_the_wrong_chain_resets_cache() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+    let first = h.call("todo_lists", json!({}));
+    assert!(first.get("isError").is_none(), "{first}");
+    let before = h.graph_requests();
+
+    let mut login = store::load(&h.dir).expect("token");
+    let login_obtained_at = "2026-08-25T13:50:05.113000Z".to_string();
+    login.obtained_at = login_obtained_at.clone();
+    login.obtained_by = "device_code".into();
+    login.refresh_token = Secret::new("RT-LOGIN");
+    store::save_atomic(&h.dir, &login, None, SaveMode::Login).expect("login");
+    let mut rotation = login;
+    rotation.obtained_at = "2026-08-25T13:50:06.113000Z".into();
+    rotation.obtained_by = "refresh".into();
+    rotation.rotated_from = Some(login_obtained_at);
+    let body = serde_json::to_vec_pretty(&rotation).expect("token JSON");
+    std::fs::write(h.dir.join("token.json"), body).expect("rotation");
+
+    let second = h.call("todo_lists", json!({}));
+    assert!(second.get("isError").is_none(), "{second}");
+    assert!(
+        h.graph_requests() > before,
+        "wrong-chain rotation kept cache"
+    );
+}
+
+#[test]
+fn frozen_mode_logout_keeps_boot_grant_but_disables_writes() {
+    let h = harness_booted(&[], RW_SCOPE);
+    let before = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        before["structuredContent"]["token"]["present"], true,
+        "{before}"
+    );
+    assert_eq!(
+        before["structuredContent"]["write_tools_enabled"], true,
+        "{before}"
+    );
+    std::fs::remove_file(h.dir.join("token.json")).expect("logout");
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["token"]["present"], false,
+        "{status}"
+    );
+    assert_eq!(
+        status["structuredContent"]["grant"], "Tasks.ReadWrite",
+        "{status}"
+    );
+    assert_eq!(
+        status["structuredContent"]["write_tools_enabled"], false,
+        "{status}"
+    );
+    let write = h.call("todo_create_tasks", json!({"tasks": [{"title": "x"}]}));
+    assert_eq!(write["isError"], true, "{write}");
+    assert!(
+        write["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("auth_required"),
+        "{write}"
+    );
+}
+
+#[test]
+fn follow_mode_account_status_without_connectivity_does_not_redeem() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    let before = h.endpoint.calls();
+    let status = h.call("todo_account_status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["connectivity"]["checked"], false,
+        "{status}"
+    );
+    assert_eq!(h.endpoint.calls(), before, "{status}");
+}
+
+#[test]
+fn an_unsigned_server_refuses_a_newly_narrowed_consent_before_graph() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    h.fx.add_list("Tasks", Some("defaultList"));
+    h.fx.reset_log();
+    *h.endpoint.scope.lock().unwrap() = Some(READ_SCOPE.to_string());
+    write_token_file(&h.dir, "RT-NEW", RW_SCOPE);
+
+    let write = h.call(
+        "todo_create_tasks",
+        json!({"list": "Tasks", "tasks": [{"title": "x"}]}),
+    );
+    assert_eq!(write["isError"], true, "{write}");
+    let text = write["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("current Microsoft Graph grant is `Tasks.Read`"),
+        "{text}"
+    );
+    assert_eq!(h.fx.count_matching("POST", "/tasks"), 0);
+}
+
+#[test]
+fn follow_signed_readwrite_has_ten_tools_and_does_not_redeem_on_write() {
+    let h = harness_follow_signed(&[], RW_SCOPE);
+    assert_eq!(h.state.list_tools().as_array().unwrap().len(), 10);
+    let before = h.endpoint.calls();
+    h.fx.add_list("Tasks", Some("defaultList"));
+    let write = h.call(
+        "todo_create_tasks",
+        json!({"list": "Tasks", "tasks": [{"title": "x"}]}),
+    );
+    assert!(write.get("isError").is_none(), "{write}");
+    assert_eq!(h.endpoint.calls(), before);
+
+    let h = harness_follow_signed(&[("TODO_MCP_SCOPE", "Tasks.Read")], RW_SCOPE);
+    assert_eq!(h.state.list_tools().as_array().unwrap().len(), 5);
+}
+
+#[test]
+fn harness_booted_readwrite_scope_builds_all_ten_tools() {
+    let h = harness_booted(&[], RW_SCOPE);
+    assert_eq!(h.state.list_tools().as_array().unwrap().len(), 10);
+}
 
 #[test]
 fn a_read_config_caps_a_readwrite_consent_in_tools_list_and_account_status() {
@@ -434,7 +816,7 @@ fn get_task_returns_full_fidelity_in_two_requests_when_warm() {
 
 #[test]
 fn account_status_makes_no_me_call_and_reports_the_grant() {
-    let h = harness(&[]);
+    let h = harness_booted(&[], RW_SCOPE);
     let r = h.ok("todo_account_status", json!({}));
     assert_eq!(r["account_id"], "default");
     assert_eq!(r["identity"], "not requested (no openid scope)");

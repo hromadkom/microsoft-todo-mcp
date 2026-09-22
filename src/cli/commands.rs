@@ -13,9 +13,9 @@ use crate::auth::device_code::{self, LoginIo};
 use crate::auth::entra::EntraClient;
 use crate::auth::store::{self, SaveMode, TokenFile};
 use crate::auth::{
-    AuthError, Grant, REVOKE_CONSENT_PATHS, TokenProvider, TokenSuccess, audit_scope,
-    effective_scope, forbidden_scope_message, grant_from_scope, scope_short_names,
-    stored_forbidden_scope_message, vet_grant,
+    AuthError, Grant, ProviderMode, REVOKE_CONSENT_PATHS, TokenProvider, TokenSuccess, audit_scope,
+    effective_scope, forbidden_scope_message, grant_from_scope, keeps_serving_without_token,
+    scope_short_names, stored_forbidden_scope_message, vet_grant,
 };
 use crate::clock::SystemClock;
 use crate::config::{Config, Need, ScopeChoice, load_config, validate_data_dir};
@@ -154,7 +154,7 @@ fn signal_refusal(name: &str, e: &std::io::Error) -> AppError {
     ))
 }
 
-fn token_provider(cfg: &Config) -> TokenProvider {
+fn token_provider(cfg: &Config, mode: ProviderMode) -> TokenProvider {
     let entra = EntraClient::new(&cfg.authority(), &cfg.client_id, cfg.http_timeout_ms);
     TokenProvider::new(
         entra,
@@ -163,6 +163,7 @@ fn token_provider(cfg: &Config) -> TokenProvider {
         &cfg.authority(),
         &cfg.scope.requested(),
         Arc::new(SystemClock),
+        mode,
     )
 }
 
@@ -181,31 +182,47 @@ pub fn serve() -> Result<i32, AppError> {
     }
     let bearer = load_or_create_bearer(&cfg.bearer_file)?;
 
-    // Refuse to start without a usable token: the tool list is frozen at boot,
-    // and logging in later would leave the write tools absent until restart.
-    let tokens = Arc::new(token_provider(&cfg));
-    if let Err(e) = tokens.access_token() {
-        if let AuthError::Entra(f) = &e {
-            logger::error(&f.render(), &[]);
+    // The opt-in flag selects follow mode even when the boot refresh succeeds.
+    let mode = if cfg.start_without_token {
+        ProviderMode::Follow
+    } else {
+        ProviderMode::Frozen
+    };
+    let tokens = Arc::new(token_provider(&cfg, mode));
+    let boot = match tokens.access_token() {
+        Ok(_) => {
+            let grant = tokens.initial_grant().unwrap_or(Grant::None);
+            if grant == Grant::None {
+                return Err(AppError::TokenStore(
+                    "the granted scope carries neither Tasks.Read nor Tasks.ReadWrite".into(),
+                ));
+            }
+            Some(grant)
         }
-        return Err(e.into());
-    }
-    let grant = tokens.initial_grant().unwrap_or(Grant::None);
-    if grant == Grant::None {
-        return Err(AppError::TokenStore(
-            "the granted scope carries neither Tasks.Read nor Tasks.ReadWrite".into(),
-        ));
-    }
-    // Once, at boot, and only scope names: extra granted scopes are warned about
-    // the same way login and doctor do.
-    if let Some(w) = tokens
-        .status()
-        .live_scope
-        .as_deref()
-        .and_then(|s| audit_scope(s, &cfg.scope.requested()).warning())
-    {
-        logger::warn(&w, &[]);
-    }
+        Err(e) => {
+            if let AuthError::Entra(f) = &e {
+                logger::error(&f.render(), &[]);
+            }
+            if !cfg.start_without_token || !keeps_serving_without_token(&e) {
+                return Err(e.into());
+            }
+            let warning = match &e {
+                AuthError::NotLoggedIn => format!(
+                    "serving without a Microsoft sign-in (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls answer auth_required until a login lands; {LOGIN_HINT}"
+                ),
+                AuthError::Transport(_) => "serving while Entra is unreachable (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls fail with the transport error until Entra answers; the next tool call retries".to_string(),
+                _ => format!(
+                    "serving although Microsoft refused the sign-in (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls answer auth_failed (auth_required once a dead refresh token has been deleted) until a login lands or the app registration is fixed; {LOGIN_HINT}"
+                ),
+            };
+            let app: AppError = e.into();
+            logger::error(&app.message(), &[("code", json!(app.code()))]);
+            logger::warn(&warning, &[]);
+            None
+        }
+    };
+    let signed_in = boot.is_some();
+    let boot_grant = if cfg.start_without_token { None } else { boot };
     let prefer_tz =
         crate::domain::datetime::prefer_tz_value(cfg.effective_tz()).map(str::to_string);
     let transport = UreqTransport::new(cfg.http_timeout_ms, cfg.max_response_bytes);
@@ -217,7 +234,9 @@ pub fn serve() -> Result<i32, AppError> {
         cfg.max_attempts,
         prefer_tz,
     );
-    let state = ServerState::new(cfg.clone(), graph, Arc::new(SystemClock), grant);
+    let state = ServerState::new(cfg.clone(), graph, Arc::new(SystemClock), boot_grant);
+    let startup_status = tokens.status();
+    let tools = state.tools.as_array().map_or(0, Vec::len);
     let mcp = Arc::new(McpServer {
         name: "microsoft-todo-mcp",
         version: env!("CARGO_PKG_VERSION"),
@@ -229,10 +248,23 @@ pub fn serve() -> Result<i32, AppError> {
         "microsoft-todo-mcp started",
         &[
             ("version", json!(env!("CARGO_PKG_VERSION"))),
-            ("grant", json!(grant.as_str())),
             (
-                "tools",
-                json!(if grant == Grant::ReadWrite { 10 } else { 5 }),
+                "grant",
+                json!(if startup_status.live_scope.is_some() {
+                    startup_status.live_grant.as_str()
+                } else {
+                    "none"
+                }),
+            ),
+            ("tools", json!(tools)),
+            ("signed_in", json!(signed_in)),
+            (
+                "mode",
+                json!(if cfg.start_without_token {
+                    "follow"
+                } else {
+                    "frozen"
+                }),
             ),
             ("tz", json!(cfg.effective_tz().name())),
             ("tz_configured", json!(cfg.tz.is_some())),
@@ -349,6 +381,7 @@ pub fn finish_login(
         refresh_token: rt,
         obtained_at: store::format_instant(obtained_at),
         obtained_by: "device_code".into(),
+        rotated_from: None,
     };
     store::save_atomic(&cfg.data_dir, &file, None, SaveMode::Login)
         .map_err(|e| AppError::TokenStore(e.to_string()))?;
@@ -626,7 +659,7 @@ pub fn doctor(verbose: bool) -> Result<i32, AppError> {
     {
         out::line("");
         out::line("microsoft graph");
-        let tokens = Arc::new(token_provider(&cfg));
+        let tokens = Arc::new(token_provider(&cfg, ProviderMode::OneShot));
         match tokens.access_token() {
             Ok(_) => {
                 let st = tokens.status();

@@ -193,10 +193,10 @@ hand-rolls a fixture Entra/Graph server on `tiny_http` (already a dependency), s
    log-hygiene parent asserts the child's stdout says `1 passed`, and the shutdown
    tests wait for the child's own log lines before signalling it.
 
-**195 tests per run: 111 unit** (in the lib; `main.rs` has none) **and 84
-integration** — cli_smoke 10, graph_client 10, http_auth 2, shutdown 6 (one is the
-`child_process_entry` body, a no-op outside the child), token_store 14, tools_read 19,
-tools_write 23 — and 0 doctests. The count is the same under the host zone, under
+**221 tests per run: 115 unit** (in the lib; `main.rs` has none) **and 106
+integration** — cli_smoke 10, graph_client 10, http_auth 2, shutdown 8 (one is the
+`child_process_entry` body, a no-op outside the child), token_store 17, tools_read 35,
+tools_write 24 — and 0 doctests. The count is the same under the host zone, under
 `TZ=Pacific/Kiritimati` and inside `docker build --target test .`.
 
 Rules:
@@ -336,7 +336,7 @@ and can print a task title.
 ## Status and where to start
 
 **Implemented and tested offline.** `auth/`, `graph/`, `domain/`, `cache.rs`,
-`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 195
+`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 221
 tests (see Tests) pass under the host zone, under `TZ=Pacific/Kiritimati` and inside
 `docker build --target test .`, with clippy `-D warnings`, `cargo fmt --check` and
 the ten gates green.
@@ -441,6 +441,18 @@ them):
   and `stopped` is still logged after it. That is safe because a refresh interrupted
   before its durable write leaves the old refresh token valid, and the kernel releases
   the flock.
+- **`serve` can optionally start before sign-in.** With
+  `TODO_MCP_START_WITHOUT_TOKEN=1`, follow mode is selected whether or not the boot
+  refresh succeeds: missing tokens, Entra refusals and unreachable Entra keep health
+  checks available; corrupt token files and refused grants still exit. The tool list
+  is the configured scope ceiling and dispatch follows the live grant. Every tool
+  call stats `token.json`; login, logout, dead-token deletion, and account switching
+  reset token state and task cache. Refresh failures back off for 30 seconds per
+  token file without hiding a still-valid access token, including after a
+  non-deleting Entra refusal. Same-chain refresh rotations are adopted silently
+  only when `rotated_from` names the prior file;
+  grant/scope transition logging belongs to `TokenProvider`, not `ServerState`.
+  No poller is needed because dispatch notices the on-disk file.
 - **The drain polls rather than nudging.** `run_http` calls `server.unblock()` once;
   the other workers leave on their 500 ms `recv_timeout`, so an idle stop takes about
   0.7 s at most (200 ms supervisor poll + 500 ms), tested at 2 s. Nothing respawns

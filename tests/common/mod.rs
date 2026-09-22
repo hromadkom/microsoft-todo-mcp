@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use microsoft_todo_mcp::auth::store::{self, SaveMode, TokenFile};
 use microsoft_todo_mcp::auth::{
-    AuthError, Grant, Secret, TokenEndpoint, TokenProvider, TokenSuccess,
+    AuthError, Grant, ProviderMode, Secret, TokenEndpoint, TokenProvider, TokenSuccess,
 };
 use microsoft_todo_mcp::clock::FixedClock;
 use microsoft_todo_mcp::config::{Config, Need, load_config};
@@ -681,6 +681,7 @@ pub struct StubEndpoint {
     pub seen_rts: Mutex<Vec<String>>,
     pub barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     pub fail_with: Mutex<Option<String>>,
+    pub on_call: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl StubEndpoint {
@@ -691,6 +692,7 @@ impl StubEndpoint {
             seen_rts: Mutex::new(Vec::new()),
             barrier: Mutex::new(None),
             fail_with: Mutex::new(None),
+            on_call: Mutex::new(None),
         }
     }
 
@@ -705,6 +707,9 @@ impl TokenEndpoint for StubEndpoint {
         self.seen_rts.lock().unwrap().push(rt.to_string());
         if let Some(b) = self.barrier.lock().unwrap().clone() {
             b.wait();
+        }
+        if let Some(f) = self.on_call.lock().unwrap().as_ref() {
+            f();
         }
         if let Some(msg) = self.fail_with.lock().unwrap().clone() {
             return Err(AuthError::Transport(msg));
@@ -743,6 +748,7 @@ pub fn write_token_file(dir: &std::path::Path, rt: &str, requested: &str) {
         refresh_token: Secret::new(rt),
         obtained_at: "2026-08-25T13:49:05.113000Z".into(),
         obtained_by: "device_code".into(),
+        rotated_from: None,
     };
     store::save_atomic(dir, &f, None, SaveMode::Login).unwrap();
 }
@@ -781,6 +787,13 @@ pub struct Harness {
     pub dir: std::path::PathBuf,
 }
 
+enum Boot {
+    Grant(Grant),
+    Refresh,
+    Unsigned,
+    FollowSigned,
+}
+
 pub fn harness(extra: &[(&str, &str)]) -> Harness {
     harness_with_grant(extra, Grant::ReadWrite)
 }
@@ -791,7 +804,7 @@ pub fn harness_with_grant(extra: &[(&str, &str)], grant: Grant) -> Harness {
         Grant::ReadOnly => "https://graph.microsoft.com/Tasks.Read offline_access",
         Grant::None => "offline_access",
     };
-    build_harness(extra, scope, Some(grant))
+    build_harness_inner(extra, scope, Boot::Grant(grant))
 }
 
 /// Boot the way `serve` does (`cli/commands.rs::serve`): one refresh through the
@@ -799,15 +812,34 @@ pub fn harness_with_grant(extra: &[(&str, &str)], grant: Grant) -> Harness {
 /// TODO_MCP_SCOPE cap and the `.All` refusal are exercised, not bypassed.
 /// `granted_scope` is what the stub token endpoint says Microsoft granted.
 pub fn harness_booted(extra: &[(&str, &str)], granted_scope: &str) -> Harness {
-    build_harness(extra, granted_scope, None)
+    build_harness_inner(extra, granted_scope, Boot::Refresh)
 }
 
-fn build_harness(extra: &[(&str, &str)], endpoint_scope: &str, grant: Option<Grant>) -> Harness {
+pub fn harness_follow_signed(extra: &[(&str, &str)], endpoint_scope: &str) -> Harness {
+    build_harness_inner(extra, endpoint_scope, Boot::FollowSigned)
+}
+
+/// Build the opt-in startup state before a token has landed on disk.
+pub fn harness_unsigned(extra: &[(&str, &str)], endpoint_scope: &str) -> Harness {
+    build_harness_inner(extra, endpoint_scope, Boot::Unsigned)
+}
+
+fn build_harness_inner(extra: &[(&str, &str)], endpoint_scope: &str, boot: Boot) -> Harness {
     let fx = Fixture::start();
     let dir = temp_dir("harness");
-    let cfg = config(&dir, extra);
+    let mut config_extra = extra.to_vec();
+    if matches!(boot, Boot::Unsigned | Boot::FollowSigned)
+        && !config_extra
+            .iter()
+            .any(|(name, _)| *name == "TODO_MCP_START_WITHOUT_TOKEN")
+    {
+        config_extra.push(("TODO_MCP_START_WITHOUT_TOKEN", "1"));
+    }
+    let cfg = config(&dir, &config_extra);
     let requested = cfg.scope.requested();
-    write_token_file(&dir, "RT-OLD", &requested);
+    if !matches!(boot, Boot::Unsigned) {
+        write_token_file(&dir, "RT-OLD", &requested);
+    }
     let clock = Arc::new(FixedClock::at(pinned_now()));
     let endpoint = Arc::new(StubEndpoint::new(endpoint_scope));
     struct Shared(Arc<StubEndpoint>);
@@ -823,13 +855,22 @@ fn build_harness(extra: &[(&str, &str)], endpoint_scope: &str, grant: Option<Gra
         &cfg.authority(),
         &requested,
         clock.clone(),
+        match boot {
+            Boot::Grant(_) | Boot::Refresh => ProviderMode::Frozen,
+            Boot::Unsigned | Boot::FollowSigned => ProviderMode::Follow,
+        },
     ));
-    let grant = match grant {
-        Some(g) => g,
-        None => {
+    let boot_grant = match boot {
+        Boot::Grant(g) => Some(g),
+        Boot::Refresh => {
             tokens.access_token().expect("boot refresh");
-            tokens.initial_grant().expect("grant after boot")
+            Some(tokens.initial_grant().expect("grant after boot"))
         }
+        Boot::FollowSigned => {
+            tokens.access_token().expect("boot refresh");
+            None
+        }
+        Boot::Unsigned => None,
     };
     let sleeps = Arc::new(Mutex::new(Vec::new()));
     let s2 = sleeps.clone();
@@ -853,7 +894,7 @@ fn build_harness(extra: &[(&str, &str)], endpoint_scope: &str, grant: Option<Gra
             blocked = cv.wait(blocked).unwrap();
         }
     });
-    let state = Arc::new(ServerState::new(cfg, graph, clock.clone(), grant));
+    let state = Arc::new(ServerState::new(cfg, graph, clock.clone(), boot_grant));
     Harness {
         fx,
         state,

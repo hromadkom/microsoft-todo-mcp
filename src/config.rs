@@ -47,6 +47,7 @@ pub struct Config {
     /// `common` by default; a tenant GUID or domain for single-tenant apps.
     pub tenant: String,
     pub scope: ScopeChoice,
+    pub start_without_token: bool,
     /// `None` means "unset": the caller resolves to UTC and warns loudly.
     pub tz: Option<Tz>,
     pub bind: SocketAddr,
@@ -170,6 +171,22 @@ pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<C
         }
     };
 
+    let start_without_token = match var("TODO_MCP_START_WITHOUT_TOKEN")
+        .as_deref()
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+    {
+        None => false,
+        Some("1" | "true" | "yes") => true,
+        Some("0" | "false" | "no") => false,
+        Some(_) => {
+            issues.push(
+                "TODO_MCP_START_WITHOUT_TOKEN must be 1, 0, true, false, yes or no".to_string(),
+            );
+            false
+        }
+    };
+
     let tz = match var("TODO_MCP_TZ") {
         None => None,
         Some(v) => match is_valid_iana(&v) {
@@ -259,6 +276,7 @@ pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<C
         client_id,
         tenant,
         scope,
+        start_without_token,
         tz,
         bind,
         data_dir,
@@ -405,6 +423,7 @@ mod tests {
         assert_eq!(cfg.client_id, ID);
         assert_eq!(cfg.tenant, "common");
         assert_eq!(cfg.scope, ScopeChoice::ReadWrite);
+        assert!(!cfg.start_without_token);
         assert_eq!(cfg.tz, None);
         assert_eq!(cfg.effective_tz(), Tz::UTC);
         assert_eq!(cfg.bind.port(), 8591);
@@ -432,7 +451,7 @@ mod tests {
 
     #[test]
     fn refusals_never_echo_the_value() {
-        let cases: [(&str, &str); 8] = [
+        let cases: [(&str, &str); 9] = [
             ("TODO_MCP_CLIENT_ID", "not-a-guid-SECRETVALUE"),
             ("TODO_MCP_SCOPE", "Mail.ReadWrite"),
             ("TODO_MCP_TZ", "Mars/Olympus_Mons"),
@@ -441,6 +460,7 @@ mod tests {
             ("TODO_MCP_MAX_PAGES", "99999999"),
             ("TODO_MCP_TENANT", "bad tenant/value"),
             ("TODO_MCP_DATA_DIR", "relative/secret-path"),
+            ("TODO_MCP_START_WITHOUT_TOKEN", "maybe"),
         ];
         for (key, value) in cases {
             // The case's own key must shadow the default client id.
@@ -449,6 +469,37 @@ mod tests {
             let msg = err.message();
             assert!(msg.contains(key), "{key}: {msg}");
             assert!(!msg.contains(value), "{key} echoed its value: {msg}");
+        }
+    }
+
+    #[test]
+    fn start_without_token_accepts_common_boolean_values() {
+        assert!(
+            !load(&[("TODO_MCP_CLIENT_ID", ID)])
+                .unwrap()
+                .start_without_token
+        );
+        for value in ["1", "true", "yes", " TRUE "] {
+            assert!(
+                load(&[
+                    ("TODO_MCP_CLIENT_ID", ID),
+                    ("TODO_MCP_START_WITHOUT_TOKEN", value)
+                ])
+                .unwrap()
+                .start_without_token,
+                "{value}"
+            );
+        }
+        for value in ["0", "false", "no", " NO "] {
+            assert!(
+                !load(&[
+                    ("TODO_MCP_CLIENT_ID", ID),
+                    ("TODO_MCP_START_WITHOUT_TOKEN", value)
+                ])
+                .unwrap()
+                .start_without_token,
+                "{value}"
+            );
         }
     }
 

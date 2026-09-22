@@ -922,16 +922,29 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
     } else {
         json!({ "checked": false, "ok": Value::Null, "detail": Value::Null })
     };
-    // Read the token status AFTER the probe so a first refresh is reflected.
     let ts = state.graph.tokens().status();
+    let eff = if state.follows_logins() {
+        ts.live_scope.is_some().then_some(ts.live_grant)
+    } else {
+        state.boot_grant()
+    };
     let live = if ts.live_scope.is_some() {
         ts.live_grant
     } else {
-        state.grant
+        eff.unwrap_or(Grant::None)
     };
-    let restart_reason = ts.restart_reason.clone();
-    let write_enabled = state.grant == Grant::ReadWrite;
-    let widened = !write_enabled && live == Grant::ReadWrite;
+    let restart_reason = state.restart_reason_for(ts.live_scope.is_some().then_some(ts.live_grant));
+    let writes_are_enabled = if state.follows_logins() {
+        eff == Some(Grant::ReadWrite) && ts.live_scope.is_some()
+    } else {
+        state.boot_grant() == Some(Grant::ReadWrite) && ts.file_present
+    };
+    let write_enabled = if state.follows_logins() && ts.file_present && ts.live_scope.is_none() {
+        Value::Null
+    } else {
+        json!(writes_are_enabled)
+    };
+    let widened = !writes_are_enabled && live == Grant::ReadWrite;
     let stats = state.cache_read().stats(std::time::Instant::now());
     let gs = state.graph.stats();
     let client_tail: String = state
@@ -953,7 +966,7 @@ pub fn todo_account_status(state: &ServerState, args: &Value) -> Value {
         "restart_required": restart_reason.is_some(),
         "restart_reason": restart_reason,
         "token": {
-            "present": ts.live_scope.is_some(),
+            "present": ts.file_present,
             "access_token_expires_at": ts.expires_at.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
             "refresh_token_obtained_at": ts.obtained_at,
             "refreshes": ts.refreshes,

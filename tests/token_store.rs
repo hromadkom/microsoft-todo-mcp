@@ -6,11 +6,12 @@ mod common;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
+use chrono::Duration;
 use common::{CLIENT_ID, StubEndpoint, config, pinned_now, temp_dir, write_token_file};
 use microsoft_todo_mcp::auth::entra::{TokenErrorBody, failure_from};
 use microsoft_todo_mcp::auth::store::{self, SaveMode, TokenFile};
 use microsoft_todo_mcp::auth::{
-    AuthError, Grant, Secret, TokenEndpoint, TokenProvider, TokenSuccess,
+    AuthError, Grant, ProviderMode, Secret, TokenEndpoint, TokenProvider, TokenSuccess,
 };
 use microsoft_todo_mcp::cli::commands::{LoginOutcome, finish_login};
 use microsoft_todo_mcp::cli::exit;
@@ -34,13 +35,30 @@ fn provider(
     client_id: &str,
     scope: &str,
 ) -> Arc<TokenProvider> {
+    provider_with_clock(
+        dir,
+        endpoint,
+        client_id,
+        scope,
+        Arc::new(FixedClock::at(pinned_now())),
+    )
+}
+
+fn provider_with_clock(
+    dir: &std::path::Path,
+    endpoint: Arc<StubEndpoint>,
+    client_id: &str,
+    scope: &str,
+    clock: Arc<FixedClock>,
+) -> Arc<TokenProvider> {
     Arc::new(TokenProvider::new(
         Shared(endpoint),
         dir.to_path_buf(),
         client_id,
         AUTHORITY,
         scope,
-        Arc::new(FixedClock::at(pinned_now())),
+        clock,
+        ProviderMode::OneShot,
     ))
 }
 
@@ -52,6 +70,7 @@ fn a_login_under_a_running_refresh_wins_and_is_adopted() {
     let barrier = Arc::new(Barrier::new(2));
     *endpoint.barrier.lock().unwrap() = Some(barrier.clone());
     let p = provider(&dir, endpoint.clone(), CLIENT_ID, SCOPE);
+    let epoch_before = p.epoch();
 
     let refresher = {
         let p = p.clone();
@@ -69,6 +88,7 @@ fn a_login_under_a_running_refresh_wins_and_is_adopted() {
         refresh_token: Secret::new("RT-NEW"),
         obtained_at: "2026-08-25T13:50:00.000000Z".into(),
         obtained_by: "device_code".into(),
+        rotated_from: None,
     };
     // Wait until the refresher has reached the endpoint before writing.
     while endpoint.calls() == 0 {
@@ -93,6 +113,11 @@ fn a_login_under_a_running_refresh_wins_and_is_adopted() {
         seen,
         vec!["RT-OLD".to_string(), "RT-NEW".to_string()],
         "adopted RT-NEW after the login landed"
+    );
+    assert_ne!(
+        p.epoch(),
+        epoch_before,
+        "adopting the login did not advance epoch"
     );
 }
 
@@ -285,11 +310,6 @@ fn a_widening_asks_for_a_restart_only_when_the_configured_scope_allows_writes() 
 
         let st = p.status();
         assert_eq!(st.initial_grant, Grant::ReadOnly, "{configured}");
-        assert_eq!(
-            st.restart_reason.is_some(),
-            expect_restart,
-            "{configured}: {st:?}"
-        );
         if !expect_restart {
             assert_eq!(st.live_grant, Grant::ReadOnly, "capped: {st:?}");
             let live = st.live_scope.clone().unwrap_or_default();
@@ -297,7 +317,86 @@ fn a_widening_asks_for_a_restart_only_when_the_configured_scope_allows_writes() 
         } else {
             assert_eq!(st.live_grant, Grant::ReadWrite, "{st:?}");
         }
+        if expect_restart {
+            assert_ne!(
+                p.status().live_grant,
+                p.initial_grant().unwrap(),
+                "{configured}"
+            );
+        } else {
+            assert_eq!(
+                p.status().live_grant,
+                p.initial_grant().unwrap(),
+                "{configured}"
+            );
+        }
     }
+}
+
+#[test]
+fn refresh_failures_back_off_until_login_or_clock_expiry() {
+    let dir = temp_dir("refresh-backoff");
+    write_token_file(&dir, "RT-OLD", SCOPE);
+    let endpoint = Arc::new(StubEndpoint::new(SCOPE));
+    *endpoint.fail_with.lock().unwrap() = Some("offline".into());
+    let clock = Arc::new(FixedClock::at(pinned_now()));
+    let p = provider_with_clock(&dir, endpoint.clone(), CLIENT_ID, SCOPE, clock.clone());
+
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
+    assert_eq!(endpoint.calls(), 1);
+
+    let mut replacement = store::load(&dir).unwrap();
+    replacement.refresh_token = Secret::new("RT-NEWER");
+    replacement.obtained_at = "2026-08-25T13:50:00.000000Z".into();
+    store::save_atomic(&dir, &replacement, None, SaveMode::Login).unwrap();
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
+    assert_eq!(endpoint.calls(), 2);
+
+    clock.set(pinned_now() + Duration::seconds(31));
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
+    assert_eq!(endpoint.calls(), 3);
+}
+
+#[test]
+fn a_failed_refresh_keeps_a_still_valid_cached_token_and_uses_post_request_backoff_time() {
+    let dir = temp_dir("refresh-backoff-valid");
+    write_token_file(&dir, "RT-OLD", SCOPE);
+    let endpoint = Arc::new(StubEndpoint::new(SCOPE));
+    let clock = Arc::new(FixedClock::at(pinned_now()));
+    let p = provider_with_clock(&dir, endpoint.clone(), CLIENT_ID, SCOPE, clock.clone());
+    let first = p.access_token().expect("initial token");
+    assert_eq!(endpoint.calls(), 1);
+    *endpoint.fail_with.lock().unwrap() = Some("offline".into());
+    clock.set(pinned_now() + Duration::seconds(3590));
+    assert!(p.access_token().is_ok());
+    assert_eq!(endpoint.calls(), 2);
+    clock.set(pinned_now() + Duration::seconds(3595));
+    assert!(p.access_token().is_ok());
+    assert_eq!(endpoint.calls(), 2);
+
+    let callback_clock = clock.clone();
+    *endpoint.on_call.lock().unwrap() = Some(Box::new(move || {
+        let now = *callback_clock.0.lock().unwrap();
+        callback_clock.set(now + Duration::seconds(20));
+    }));
+    clock.set(pinned_now() + Duration::seconds(3621));
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
+    assert_eq!(endpoint.calls(), 3);
+    clock.set(pinned_now() + Duration::seconds(3646));
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
+    assert_eq!(endpoint.calls(), 3);
+    clock.set(pinned_now() + Duration::seconds(3672));
+    let r = p.access_token();
+    assert!(matches!(&r, Err(AuthError::Transport(_))), "{r:?}");
+    assert_eq!(endpoint.calls(), 4);
+    let _ = first;
 }
 
 fn token_success(scope: &str, refresh_token: Option<&str>) -> TokenSuccess {
@@ -399,6 +498,7 @@ fn finish_login_under_a_read_config_saves_and_reports_the_capped_grant() {
 /// parks inside the "network call" first, so a test can land a `login` there.
 struct Refuses {
     code: i64,
+    succeed_first: bool,
     barrier: Option<Arc<Barrier>>,
     calls: Arc<AtomicUsize>,
     seen_rts: Arc<Mutex<Vec<String>>>,
@@ -408,6 +508,7 @@ impl Refuses {
     fn new(code: i64) -> Self {
         Self {
             code,
+            succeed_first: false,
             barrier: None,
             calls: Arc::default(),
             seen_rts: Arc::default(),
@@ -417,8 +518,11 @@ impl Refuses {
 
 impl TokenEndpoint for Refuses {
     fn redeem_refresh_token(&self, rt: &str, _scope: &str) -> Result<TokenSuccess, AuthError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         self.seen_rts.lock().unwrap().push(rt.to_string());
+        if self.succeed_first && call == 1 {
+            return Ok(token_success(_scope, Some("RT-NEW")));
+        }
         if let Some(b) = &self.barrier {
             b.wait();
         }
@@ -441,7 +545,34 @@ fn refusing_provider(dir: &std::path::Path, endpoint: Refuses) -> TokenProvider 
         AUTHORITY,
         SCOPE,
         Arc::new(FixedClock::at(pinned_now())),
+        ProviderMode::OneShot,
     )
+}
+
+#[test]
+fn a_non_deleting_entra_refusal_keeps_a_still_valid_cached_token() {
+    let dir = temp_dir("entra-fallback");
+    write_token_file(&dir, "RT-OLD", SCOPE);
+    let endpoint = Refuses {
+        succeed_first: true,
+        ..Refuses::new(9002313)
+    };
+    let calls = endpoint.calls.clone();
+    let clock = Arc::new(FixedClock::at(pinned_now()));
+    let p = TokenProvider::new(
+        endpoint,
+        dir.clone(),
+        CLIENT_ID,
+        AUTHORITY,
+        SCOPE,
+        clock.clone(),
+        ProviderMode::OneShot,
+    );
+    let first = p.access_token().expect("initial token");
+    clock.set(pinned_now() + Duration::seconds(3590));
+    let second = p.access_token().expect("cached token after refusal");
+    assert_eq!(first.expose(), second.expose());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -519,6 +650,7 @@ fn a_login_during_a_dead_token_refresh_is_neither_deleted_nor_redeemed() {
         refresh_token: Secret::new("RT-NEW"),
         obtained_at: "2026-08-25T13:50:00.000000Z".into(),
         obtained_by: "device_code".into(),
+        rotated_from: None,
     };
     store::save_atomic(&dir, &login, None, SaveMode::Login).unwrap();
     barrier.wait();
