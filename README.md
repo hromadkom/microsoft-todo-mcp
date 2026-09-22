@@ -16,7 +16,7 @@ nothing else.
 >
 > | | |
 > |---|---|
-> | **Test suite** | 221 tests (115 unit, 106 integration) against a hand-rolled fixture Entra/Graph server. Green under the host time zone and under `TZ=Pacific/Kiritimati`, and inside `docker build --target test .` |
+> | **Test suite** | 229 tests (119 unit, 110 integration) against a hand-rolled fixture Entra/Graph server. Green under the host time zone and under `TZ=Pacific/Kiritimati`, and inside `docker build --target test .` |
 > | **Release image** | Built for `linux/amd64` and `linux/arm64` through the size gate, and checked on macOS arm64 Docker Desktop: user `65534:65534`, `/data` volume, healthcheck, no shell. A compose run with a fake client ID showed a fresh named volume's `/data` owned `65534:65534` mode `0700` (Docker Desktop keeps named volumes on ext4 inside its Linux VM; only bind mounts go through VirtioFS), and the `Restarting (3)` refusal without a sign-in |
 > | **Linux** | CI's `Release image` job asserts that first-mount ownership again on the amd64 image on a native Linux engine, and is the only evidence for `docker stop` during boot exiting 0 within 2 s (as PID 1, no init). Stopping a running server, and its drain, are tested on the host by `tests/shutdown.rs` |
 > | **Never done** | A run against a real Microsoft account. The live-Graph assumptions — `$batch` on `/me/todo/*`, whether `null` clears a due date, which Windows zone names a date write accepts, the exact scopes Microsoft grants — are still assumptions. [CHANGELOG.md](CHANGELOG.md) lists them all |

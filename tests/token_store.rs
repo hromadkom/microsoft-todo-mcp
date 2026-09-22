@@ -677,3 +677,85 @@ fn a_login_during_a_dead_token_refresh_is_neither_deleted_nor_redeemed() {
     assert_eq!(disk.refresh_token.expose(), "RT-NEW");
     assert_eq!(disk.obtained_by, "device_code");
 }
+
+const DELETION_LOG_CHILD: &str = "TODO_MCP_DELETION_LOG_CHILD";
+const DELETION_LOG_MARKER: &str = "deletion-log child: boot done";
+const DELETION_LINE: &str = "deleted token.json: Microsoft says this token can never be used again";
+
+/// A dead-token refusal at boot is one persistent line, not two: `boot_token`
+/// does not log the deletion, because the refusal `serve`/`main` logs carries
+/// the `token.json was deleted` note itself. A runtime `access_token` still
+/// warns, since nothing else logs a refused runtime refresh. `logger` writes to
+/// fd 2, which libtest does not capture, so this re-runs THIS binary as a child
+/// with `env_clear()` and reads the child's real stderr.
+#[test]
+fn a_dead_token_deletion_is_logged_by_a_runtime_refresh_but_not_by_the_boot_refresh() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env(DELETION_LOG_CHILD, "1")
+        .args([
+            "--exact",
+            "child_boot_then_runtime_dead_token_refresh",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+    // Proves the child really ran (a filter typo would run zero tests and pass).
+    assert!(stdout.contains("1 passed"), "child did not run:\n{stdout}");
+    let lines: Vec<serde_json::Value> = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let marker = lines
+        .iter()
+        .position(|v| v["msg"] == DELETION_LOG_MARKER)
+        .unwrap_or_else(|| panic!("the child never logged its marker:\n{stderr}"));
+    let (boot, runtime) = lines.split_at(marker);
+    assert!(
+        !boot.iter().any(|v| v["msg"] == DELETION_LINE),
+        "the boot refresh logged the deletion itself:\n{stderr}"
+    );
+    let warned: Vec<&serde_json::Value> = runtime
+        .iter()
+        .filter(|v| v["msg"] == DELETION_LINE)
+        .collect();
+    assert_eq!(warned.len(), 1, "runtime deletion lines:\n{stderr}");
+    assert_eq!(warned[0]["level"], "warn", "{}", warned[0]);
+    assert_eq!(warned[0]["code"], "AADSTS70008", "{}", warned[0]);
+    // Neither path logs Microsoft's text.
+    assert!(
+        !stderr.contains("refused"),
+        "error_description reached stderr:\n{stderr}"
+    );
+}
+
+/// Runs only as the parent's child; a no-op in the normal suite.
+#[test]
+fn child_boot_then_runtime_dead_token_refresh() {
+    if std::env::var_os(DELETION_LOG_CHILD).is_none() {
+        return;
+    }
+    for (label, boot) in [("boot", true), ("runtime", false)] {
+        let dir = temp_dir(&format!("deletion-log-{label}"));
+        write_token_file(&dir, "RT-OLD", SCOPE);
+        let p = refusing_provider(&dir, Refuses::new(70008));
+        let result = if boot {
+            p.boot_token()
+        } else {
+            p.access_token()
+        };
+        let Err(AuthError::Entra(f)) = result else {
+            panic!("{label}: expected an Entra refusal");
+        };
+        // Both paths really deleted, so the boot path's silence is a real claim.
+        assert!(f.token_deleted, "{label}: {}", f.render());
+        assert!(!dir.join("token.json").exists(), "{label}");
+        if boot {
+            microsoft_todo_mcp::logger::info(DELETION_LOG_MARKER, &[]);
+        }
+    }
+}

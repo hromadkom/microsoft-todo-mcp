@@ -149,6 +149,29 @@ impl EntraFailure {
             None => self.error.clone(),
         }
     }
+
+    /// The one error `serve` logs for a refused boot refresh (SECURITY.md, "Put
+    /// task content in the `serve` log"). It carries the code (or the OAuth
+    /// `error` string), this project's own summary and remediation, and the
+    /// Trace ID and Correlation ID Microsoft support asks for. It never carries
+    /// `description`: Microsoft's `error_description` can quote the account name,
+    /// and stderr is persisted by the compose `json-file` driver. `render()` and
+    /// `AppError::from_auth` keep the description for stdout and tool results.
+    pub fn log_error(&self) -> AppError {
+        let mut summary = self.diagnosis.summary.to_string();
+        if self.trace_id.is_some() || self.correlation_id.is_some() {
+            summary.push_str(&format!(
+                " (Trace ID: {}, Correlation ID: {})",
+                self.trace_id.as_deref().unwrap_or("-"),
+                self.correlation_id.as_deref().unwrap_or("-")
+            ));
+        }
+        AppError::Auth {
+            code: self.code_label(),
+            summary,
+            remediation: self.remediation(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -524,6 +547,15 @@ pub struct TokenProvider {
     state: Mutex<ProviderState>,
 }
 
+/// Whether `refresh_locked` logs a dead-token deletion itself. `Silent` is for
+/// the boot refresh only, whose refusal is logged once by the caller with the
+/// deletion note included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeletionLog {
+    Warn,
+    Silent,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileChange {
     Unchanged,
@@ -588,9 +620,23 @@ impl TokenProvider {
     }
 
     pub fn access_token_with_grant(&self) -> Result<(Secret, Grant), AuthError> {
+        self.token(DeletionLog::Warn)
+    }
+
+    /// `serve`'s boot refresh: `access_token`, except that a dead-token deletion
+    /// is not logged here. The refusal `main` (or follow-mode `serve`) logs from
+    /// `EntraFailure::log_error` already carries the deletion note, and a refused
+    /// boot is one persistent line (SECURITY.md). A refused runtime refresh is
+    /// logged by nothing else — it goes to the tool caller — so `access_token`
+    /// keeps the warning.
+    pub fn boot_token(&self) -> Result<Secret, AuthError> {
+        self.token(DeletionLog::Silent).map(|(token, _)| token)
+    }
+
+    fn token(&self, deletion_log: DeletionLog) -> Result<(Secret, Grant), AuthError> {
         self.notice_token_file();
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        self.refresh_locked(st, self.clock.now())
+        self.refresh_locked(st, self.clock.now(), deletion_log)
     }
 
     fn reset_state_for_file(&self, st: &mut ProviderState, seen: FileSeen) {
@@ -634,6 +680,7 @@ impl TokenProvider {
         &self,
         mut st: MutexGuard<'_, ProviderState>,
         now: DateTime<Utc>,
+        deletion_log: DeletionLog,
     ) -> Result<(Secret, Grant), AuthError> {
         if let Some(c) = &st.cached
             && now + REFRESH_SKEW < c.expires_at
@@ -671,10 +718,14 @@ impl TokenProvider {
                             Ok(Some(seen)) => {
                                 f.token_deleted = true;
                                 self.reset_state_for_file(&mut st, seen);
-                                logger::warn(
-                                    "deleted token.json: Microsoft says this token can never be used again",
-                                    &[("code", serde_json::json!(f.code_label()))],
-                                );
+                                // At boot the refusal `main` logs carries the
+                                // deletion note (`TOKEN_DELETED`) itself.
+                                if deletion_log == DeletionLog::Warn {
+                                    logger::warn(
+                                        "deleted token.json: Microsoft says this token can never be used again",
+                                        &[("code", serde_json::json!(f.code_label()))],
+                                    );
+                                }
                             }
                             Ok(None) => {}
                             Err(e) => logger::warn(
@@ -850,6 +901,76 @@ impl TokenProvider {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A refusal whose description names the account, the way Microsoft's
+    /// sign-in and Conditional Access messages do.
+    fn refusal_naming_the_account(code: Option<i64>, error: &str) -> EntraFailure {
+        EntraFailure {
+            error: error.into(),
+            code,
+            codes: code.into_iter().collect(),
+            description: "User 'ACCOUNT-MARKER@example.invalid' is blocked.".into(),
+            trace_id: Some("trace-1".into()),
+            correlation_id: Some("corr-1".into()),
+            diagnosis: aadsts::diagnose(&code.into_iter().collect::<Vec<_>>(), error),
+            token_deleted: false,
+        }
+    }
+
+    #[test]
+    fn the_logged_error_keeps_code_ids_and_own_text_but_never_the_description() {
+        let f = refusal_naming_the_account(Some(530036), "invalid_grant");
+        // The stdout and tool-result forms still carry Microsoft's text …
+        assert!(f.render().contains("ACCOUNT-MARKER"), "{}", f.render());
+        assert!(
+            AppError::from_auth(&AuthError::Entra(Box::new(f.clone())))
+                .message()
+                .contains("ACCOUNT-MARKER")
+        );
+        // … the log form never does.
+        let logged = f.log_error();
+        assert_eq!(logged.code(), "AUTH_FAILED");
+        let line = logged.message();
+        assert!(!line.contains("ACCOUNT-MARKER"), "{line}");
+        assert!(!line.contains("Microsoft said"), "{line}");
+        for needle in [
+            "AADSTS530036",
+            f.diagnosis.summary,
+            f.diagnosis.remediation,
+            "Trace ID: trace-1",
+            "Correlation ID: corr-1",
+        ] {
+            assert!(line.contains(needle), "{line:?} lacks {needle:?}");
+        }
+    }
+
+    #[test]
+    fn the_logged_error_names_the_oauth_error_when_there_is_no_code() {
+        let mut f = refusal_naming_the_account(None, "some_new_error");
+        f.trace_id = None;
+        let line = f.log_error().message();
+        assert!(!line.contains("ACCOUNT-MARKER"), "{line}");
+        assert!(line.contains("(some_new_error)"), "{line}");
+        assert!(line.contains("does not recognise"), "{line}");
+        assert!(
+            line.contains("Trace ID: -, Correlation ID: corr-1"),
+            "{line}"
+        );
+
+        f.correlation_id = None;
+        let line = f.log_error().message();
+        // No ids, no id clause (the remediation's own "Trace ID" wording stays).
+        assert!(!line.contains("(Trace ID:"), "{line}");
+    }
+
+    #[test]
+    fn the_logged_error_carries_the_deletion_note() {
+        let mut f = refusal_naming_the_account(Some(70008), "invalid_grant");
+        f.token_deleted = true;
+        let line = f.log_error().message();
+        assert!(line.contains(TOKEN_DELETED), "{line}");
+        assert!(!line.contains("ACCOUNT-MARKER"), "{line}");
+    }
 
     #[test]
     fn keep_serving_policy_only_tolerates_authentication_availability_failures() {

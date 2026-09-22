@@ -167,6 +167,21 @@ fn token_provider(cfg: &Config, mode: ProviderMode) -> TokenProvider {
     )
 }
 
+/// The error `serve` logs when the boot refresh fails. An Entra refusal is
+/// narrowed to `EntraFailure::log_error` — the code, this project's own summary
+/// and remediation, and the trace ids, never Microsoft's `error_description`,
+/// which can quote the account name (SECURITY.md). `login` and `doctor` print
+/// `render()` to stdout instead; that is a different question. The line is the
+/// whole record of the refusal: the boot goes through `TokenProvider::boot_token`,
+/// which does not log a dead-token deletion separately, because the remediation
+/// here already says `token.json was deleted`.
+fn boot_error(e: &AuthError) -> AppError {
+    match e {
+        AuthError::Entra(f) => f.log_error(),
+        other => AppError::from_auth(other),
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 pub fn serve() -> Result<i32, AppError> {
@@ -189,7 +204,7 @@ pub fn serve() -> Result<i32, AppError> {
         ProviderMode::Frozen
     };
     let tokens = Arc::new(token_provider(&cfg, mode));
-    let boot = match tokens.access_token() {
+    let boot = match tokens.boot_token() {
         Ok(_) => {
             let grant = tokens.initial_grant().unwrap_or(Grant::None);
             if grant == Grant::None {
@@ -200,11 +215,9 @@ pub fn serve() -> Result<i32, AppError> {
             Some(grant)
         }
         Err(e) => {
-            if let AuthError::Entra(f) = &e {
-                logger::error(&f.render(), &[]);
-            }
             if !cfg.start_without_token || !keeps_serving_without_token(&e) {
-                return Err(e.into());
+                // `main` logs the returned error: one refusal, one line.
+                return Err(boot_error(&e));
             }
             let warning = match &e {
                 AuthError::NotLoggedIn => format!(
@@ -215,7 +228,7 @@ pub fn serve() -> Result<i32, AppError> {
                     "serving although Microsoft refused the sign-in (TODO_MCP_START_WITHOUT_TOKEN): /healthz is 200 and tool calls answer auth_failed (auth_required once a dead refresh token has been deleted) until a login lands or the app registration is fixed; {LOGIN_HINT}"
                 ),
             };
-            let app: AppError = e.into();
+            let app = boot_error(&e);
             logger::error(&app.message(), &[("code", json!(app.code()))]);
             logger::warn(&warning, &[]);
             None
@@ -792,6 +805,33 @@ mod tests {
     use super::*;
 
     const RW: &str = "https://graph.microsoft.com/Tasks.ReadWrite offline_access";
+
+    #[test]
+    fn a_boot_refusal_is_logged_without_microsofts_description() {
+        use crate::auth::EntraFailure;
+        let f = EntraFailure {
+            error: "invalid_grant".into(),
+            code: Some(50194),
+            codes: vec![50194],
+            description: "Account 'ACCOUNT-MARKER@example.invalid' is not in the tenant.".into(),
+            trace_id: Some("trace-1".into()),
+            correlation_id: Some("corr-1".into()),
+            diagnosis: crate::auth::aadsts::diagnose(&[50194], "invalid_grant"),
+            token_deleted: false,
+        };
+        let e = AuthError::Entra(Box::new(f));
+        let line = boot_error(&e).message();
+        assert!(!line.contains("ACCOUNT-MARKER"), "{line}");
+        assert!(line.contains("AADSTS50194"), "{line}");
+        assert!(line.contains("Trace ID: trace-1"), "{line}");
+        assert!(line.contains("Correlation ID: corr-1"), "{line}");
+        assert!(line.contains("TODO_MCP_TENANT"), "{line}");
+        // Every other boot failure keeps its usual message.
+        assert_eq!(
+            boot_error(&AuthError::NotLoggedIn).message(),
+            AppError::NotLoggedIn.message()
+        );
+    }
 
     #[test]
     fn grant_summary_says_when_todo_mcp_scope_capped_the_grant() {

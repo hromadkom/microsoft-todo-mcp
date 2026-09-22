@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`serve` no longer logs Microsoft's `error_description` from a refused boot
+  refresh.** The one line it logs now carries the AADSTS code (or the OAuth `error`
+  string), this project's own summary and remediation, and the Trace ID and
+  Correlation ID. Microsoft's sign-in and Conditional Access messages commonly quote
+  the account name, and the compose `json-file` driver persists stderr through every
+  restart. The refusal used to be logged twice, by `serve` and again by `main`; it is
+  now logged once, also when it deletes a dead `token.json`: the boot refresh
+  (`TokenProvider::boot_token`) no longer logs the deletion separately, since the
+  remediation in that line already says so. A runtime refresh still logs it. `login` and `doctor` still print the full text to stdout, and a
+  refused tool call still returns it to the MCP client. SECURITY.md records the
+  decision in place of the former "Known gaps" bullet. (#8)
+
 ### Fixed
 
 - **`timezone_mode` no longer reports `client_side` on a mailbox that honours the
