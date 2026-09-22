@@ -119,7 +119,12 @@ leaves, importing no crate module: clock, errors, logger, mcp, sem
   `cache::log_ref("lst", &id)`. A refused boot refresh is logged once, by `main`, from
   `EntraFailure::log_error` (code, own summary and remediation, trace ids), never from
   `render()` or `AppError::from_auth`, which keep the description for `login`/`doctor`
-  stdout and tool results. `cli/commands.rs::boot_error` is the chokepoint.
+  stdout and tool results. `cli/commands.rs::boot_error` is the chokepoint, and that
+  line is the whole record: `serve` boots through `TokenProvider::boot_token`, which
+  does not log a dead-token deletion separately (the remediation already says
+  `token.json was deleted`); `access_token` keeps the `deleted token.json` warning for
+  runtime refreshes, where nothing else logs the refusal. The re-exec pair in
+  `tests/token_store.rs` reads the real stderr for both.
   The test is the re-exec pair in `tests/tools_read.rs`
   (`a_failed_batch_sub_request_logs_neither_the_list_name_nor_its_id` /
   `child_sync_with_a_failing_sub_request`). `doctor` printing list names and (with
@@ -192,15 +197,16 @@ hand-rolls a fixture Entra/Graph server on `tiny_http` (already a dependency), s
    the code under test cannot run offline or in-process, a test re-executes **its own
    test binary** as a child with `env_clear()` and an env flag:
    `tests/shutdown.rs` (`child_process_entry`, `TODO_MCP_SHUTDOWN_TEST_CHILD`),
-   because a booted `serve` needs a live Entra; and the log-hygiene pair in
-   `tests/tools_read.rs` (`TODO_MCP_LOG_HYGIENE_CHILD`), because libtest does not
-   capture `logger`'s writes to fd 2. Neither can pass vacuously on a filter typo: the
-   log-hygiene parent asserts the child's stdout says `1 passed`, and the shutdown
-   tests wait for the child's own log lines before signalling it.
+   because a booted `serve` needs a live Entra; and the log-hygiene pairs in
+   `tests/tools_read.rs` (`TODO_MCP_LOG_HYGIENE_CHILD`) and `tests/token_store.rs`
+   (`TODO_MCP_DELETION_LOG_CHILD`, the boot-vs-runtime deletion warning), because
+   libtest does not capture `logger`'s writes to fd 2. None can pass vacuously on a
+   filter typo: the log-hygiene parents assert the child's stdout says `1 passed`, and
+   the shutdown tests wait for the child's own log lines before signalling it.
 
-**225 tests per run: 119 unit** (in the lib; `main.rs` has none) **and 106
+**227 tests per run: 119 unit** (in the lib; `main.rs` has none) **and 108
 integration** — cli_smoke 10, graph_client 10, http_auth 2, shutdown 8 (one is the
-`child_process_entry` body, a no-op outside the child), token_store 17, tools_read 35,
+`child_process_entry` body, a no-op outside the child), token_store 19, tools_read 35,
 tools_write 24 — and 0 doctests. The count is the same under the host zone, under
 `TZ=Pacific/Kiritimati` and inside `docker build --target test .`.
 
@@ -341,7 +347,7 @@ and can print a task title.
 ## Status and where to start
 
 **Implemented and tested offline.** `auth/`, `graph/`, `domain/`, `cache.rs`,
-`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 225
+`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 227
 tests (see Tests) pass under the host zone, under `TZ=Pacific/Kiritimati` and inside
 `docker build --target test .`, with clippy `-D warnings`, `cargo fmt --check` and
 the ten gates green.

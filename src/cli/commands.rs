@@ -171,7 +171,10 @@ fn token_provider(cfg: &Config, mode: ProviderMode) -> TokenProvider {
 /// narrowed to `EntraFailure::log_error` — the code, this project's own summary
 /// and remediation, and the trace ids, never Microsoft's `error_description`,
 /// which can quote the account name (SECURITY.md). `login` and `doctor` print
-/// `render()` to stdout instead; that is a different question.
+/// `render()` to stdout instead; that is a different question. The line is the
+/// whole record of the refusal: the boot goes through `TokenProvider::boot_token`,
+/// which does not log a dead-token deletion separately, because the remediation
+/// here already says `token.json was deleted`.
 fn boot_error(e: &AuthError) -> AppError {
     match e {
         AuthError::Entra(f) => f.log_error(),
@@ -201,7 +204,7 @@ pub fn serve() -> Result<i32, AppError> {
         ProviderMode::Frozen
     };
     let tokens = Arc::new(token_provider(&cfg, mode));
-    let boot = match tokens.access_token() {
+    let boot = match tokens.boot_token() {
         Ok(_) => {
             let grant = tokens.initial_grant().unwrap_or(Grant::None);
             if grant == Grant::None {
