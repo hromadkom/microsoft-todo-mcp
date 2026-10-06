@@ -24,17 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`token` and `serve` started together now agree on the MCP bearer.** On an empty
-  volume, `docker compose up -d` and `docker compose run --rm todo-mcp token` could
-  each generate a different `bearer.token`, and the bearer the operator captured
-  was then rejected with 401. A reader could also find the file empty mid-write and
-  generate its own. The bearer is now written to a temporary file beside it and
-  published with a hard link that fails if the file exists; the loser adopts the
-  winner's value, and no reader sees a partial file. An empty `bearer.token` is
-  still repaired, by one process under a lock, and now comes back mode `0600`
-  instead of keeping its old mode. No temporary file is left behind on any error.
-  The bearer's directory must support hard links (Docker's default `local` volume
-  driver, ext4, xfs, btrfs, tmpfs and overlayfs all do). A dangling symlink at the bearer path is now refused instead of
-  written through. (#14)
+  volume, `docker compose up -d` and `docker compose run --rm -T todo-mcp token`
+  could each generate a different `bearer.token`, and the bearer the operator
+  captured was then rejected with 401. A reader could also find the file empty
+  mid-write and generate its own. A new bearer is now written to a temporary file
+  beside it and published with a hard link that fails if the file exists; the loser
+  adopts the winner's value, and no reader sees a partial file. An empty or blank
+  `bearer.token` is still filled in place, keeping its owner and mode, but by one
+  process under a lock on it, and the others adopt its value. No temporary file is
+  left behind on an error. Generating a bearer now needs a directory that supports
+  hard links (Docker's `local` volumes, ext4, xfs, btrfs, tmpfs and overlayfs do;
+  FAT, exFAT and some SMB shares do not, and the error says so). A dangling symlink
+  at the bearer path, or an empty one that is not a regular file such as
+  `/dev/null`, is now refused instead of written through. (#14)
 - **`doctor` no longer stops at the first configuration error.** Each invalid
   setting is now its own finding, and the report goes on to the data directory and
   token store, so a mistyped `TODO_MCP_TZ` or `TODO_MCP_TENANT` no longer hides the
