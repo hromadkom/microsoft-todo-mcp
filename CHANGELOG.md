@@ -36,7 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hard links (Docker's `local` volumes, ext4, xfs, btrfs, tmpfs and overlayfs do;
   FAT, exFAT and some SMB shares do not, and the error says so). A dangling symlink
   at the bearer path, or an empty one that is not a regular file such as
-  `/dev/null`, is now refused instead of written through. (#14)
+  `/dev/null`, is now refused instead of written through, and `doctor` reports
+  both as findings instead of promising to generate a bearer there. (#14)
 - **`doctor` no longer stops at the first configuration error.** Each invalid
   setting is now its own finding, and the report goes on to the data directory and
   token store, so a mistyped `TODO_MCP_TZ` or `TODO_MCP_TENANT` no longer hides the

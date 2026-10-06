@@ -98,6 +98,12 @@ fn settle_bearer(path: &Path) -> Result<Bearer, AppError> {
 /// the bearer being written, or adopt one that is about to be rolled back. The fd
 /// and its lock close on return, before the caller may take the exclusive lock on
 /// another fd, which would otherwise wait for this one forever.
+///
+/// flock excludes only processes that share a kernel's locks. Where a filesystem
+/// keeps them local to each client (NFS mounted `nolock` or `local_lock=flock`,
+/// FUSE without flock support), callers on two hosts could both fill a blank file;
+/// the hard-link create stays exclusive there, because the server refuses the
+/// second link.
 fn read_bearer(path: &Path) -> std::io::Result<String> {
     use std::io::Read as _;
 
@@ -303,9 +309,9 @@ pub fn exit_on_interrupt() {
 /// signal starts the drain in `http::run_http` and the second exits 0 without
 /// waiting for it.
 ///
-/// `tests/shutdown.rs` regression-tests the boot phase only inside the refresh
-/// (the one boot step that can be parked hermetically), not that this runs
-/// ahead of config, the `/data` probe and the bearer.
+/// `tests/shutdown.rs` regression-tests the boot phase inside the bearer step and
+/// the refresh (the boot steps that can be parked hermetically, on a flock), not
+/// that this runs ahead of config and the `/data` probe.
 pub struct Shutdown {
     booting: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
@@ -889,7 +895,24 @@ pub fn doctor(verbose: bool) -> Result<i32, AppError> {
             Err(e) => finding(&e.message()),
         }
         let bearer_state = match std::fs::metadata(&cfg.bearer_file) {
-            Ok(_) => "present".to_string(),
+            Ok(m) if m.file_type().is_file() => "present".to_string(),
+            Ok(_) => {
+                finding(&format!(
+                    "the bearer file {} is not a regular file, so `token` and `serve` cannot keep a bearer in it. Fix: point TODO_MCP_BEARER_FILE at a regular file",
+                    cfg.bearer_file.display()
+                ));
+                "not a regular file".to_string()
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(&cfg.bearer_file).is_ok() =>
+            {
+                finding(&format!(
+                    "the bearer file {} is a dangling symlink, which `token` and `serve` refuse. Fix: remove it, or create its target holding a bearer",
+                    cfg.bearer_file.display()
+                ));
+                "dangling symlink".to_string()
+            }
             Err(_) => "absent (generated on first `token` or `serve`)".to_string(),
         };
         out::line(&format!("  bearer: {bearer_state}"));
@@ -1318,7 +1341,8 @@ mod tests {
             let path = parent.join("bearer.token");
             let barrier = Arc::new(std::sync::Barrier::new(BEARER_RACERS + 1));
             let done = Arc::new(AtomicBool::new(false));
-            // Reads without any lock, the way every caller's fast path does. It must
+            // Reads without any lock, which is stricter than `read_bearer`: a
+            // hard-linked file must look whole even to an operator's `cat`. It must
             // only ever see no file or a whole bearer: never an empty or partial one.
             let reader = {
                 let (path, barrier, done) = (path.clone(), Arc::clone(&barrier), done.clone());
