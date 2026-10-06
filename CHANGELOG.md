@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`doctor` no longer stops at the first configuration error.** Each invalid
+  setting is now its own finding, and the report goes on to the data directory and
+  token store, so a mistyped `TODO_MCP_TZ` or `TODO_MCP_TENANT` no longer hides the
+  `/data` probe or the `token.json` state. The Microsoft Graph check is skipped, and
+  says why, while the client ID, tenant, scope or data directory is invalid; an
+  invalid `TODO_MCP_DATA_DIR` also skips the data directory and token store checks.
+  A rejected value is shown as rejected, never as the default that stands in for it,
+  and is never echoed. `serve`, `login`, `logout`, `token` and `healthcheck` refuse
+  exactly as before. (#13)
 - **`timezone_mode` no longer reports `client_side` on a mailbox that honours the
   preference.** Graph applies `Prefer: outlook.timezone` on `/me/todo/*` without
   ever sending `Preference-Applied`, so the header-only check settled the wrong

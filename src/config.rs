@@ -7,6 +7,10 @@
 //! the variable, state the range. The deliberate exception is a path that failed a
 //! file-system check (`validate_data_dir` here, the bearer file in `cli::commands`):
 //! a path is not a secret, and it is the one thing the operator needs to fix it.
+//!
+//! `resolve_config` is the same parse without the refusal, for `doctor`: each
+//! [`ConfigIssue`] is one of those messages, and a rejected value falls back to its
+//! default, so the partial `Config` never holds an offending value either.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -107,30 +111,73 @@ pub fn is_valid_iana(name: &str) -> Option<Tz> {
         .find(|tz| tz.name().eq_ignore_ascii_case(name))
 }
 
+/// One rejected variable: the variable, and a message that names it and states
+/// what it accepts, never the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigIssue {
+    pub var: &'static str,
+    pub message: String,
+}
+
+/// What [`resolve_config`] made of the environment: a `Config` in which every
+/// rejected value was replaced by its default, and the issues that rejected them.
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    pub config: Config,
+    pub issues: Vec<ConfigIssue>,
+}
+
+impl Resolved {
+    /// Whether `var` was rejected, so its `config` field holds a default.
+    pub fn rejected(&self, var: &str) -> bool {
+        self.issues.iter().any(|i| i.var == var)
+    }
+}
+
 /// Parse configuration through an injected getter (prod: `|k| std::env::var(k).ok()`).
 /// A value that trims to empty counts as unset. All issues are collected and
 /// reported together.
 pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<Config, AppError> {
+    let resolved = resolve_config(get, need);
+    if resolved.issues.is_empty() {
+        return Ok(resolved.config);
+    }
+    let messages: Vec<&str> = resolved.issues.iter().map(|i| i.message.as_str()).collect();
+    Err(AppError::Config(messages.join("; ")))
+}
+
+/// [`load_config`] without the refusal, for `doctor`, which reports each issue
+/// as its own finding and keeps going. Every caller that acts on the
+/// configuration goes through `load_config`.
+pub fn resolve_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Resolved {
     let var = |key: &str| {
         get(key)
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    let mut issues: Vec<String> = Vec::new();
+    let mut issues: Vec<ConfigIssue> = Vec::new();
+    // Every message is the variable's name and what it accepts, never the value.
+    let mut reject = |var: &'static str, rule: &str| {
+        issues.push(ConfigIssue {
+            var,
+            message: format!("{var} {rule}"),
+        });
+    };
 
     let client_id = match var("TODO_MCP_CLIENT_ID") {
         Some(v) if looks_like_client_id(&v) => v,
         Some(_) => {
-            issues.push(
-                "TODO_MCP_CLIENT_ID must be the Application (client) ID GUID from your app registration"
-                    .to_string(),
+            reject(
+                "TODO_MCP_CLIENT_ID",
+                "must be the Application (client) ID GUID from your app registration",
             );
             String::new()
         }
         None => {
             if need == Need::ClientId {
-                issues.push(
-                    "TODO_MCP_CLIENT_ID is required — see docs/app-registration.md".to_string(),
+                reject(
+                    "TODO_MCP_CLIENT_ID",
+                    "is required — see docs/app-registration.md",
                 );
             }
             String::new()
@@ -138,9 +185,9 @@ pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<C
     };
 
     if var("TODO_MCP_CLIENT_SECRET").is_some() {
-        issues.push(
-            "TODO_MCP_CLIENT_SECRET must not be set: this is a public client and never sends a secret"
-                .to_string(),
+        reject(
+            "TODO_MCP_CLIENT_SECRET",
+            "must not be set: this is a public client and never sends a secret",
         );
     }
 
@@ -153,9 +200,9 @@ pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<C
             v
         }
         Some(_) => {
-            issues.push(
-                "TODO_MCP_TENANT must be a tenant GUID, a verified domain, or one of common/organizations/consumers"
-                    .to_string(),
+            reject(
+                "TODO_MCP_TENANT",
+                "must be a tenant GUID, a verified domain, or one of common/organizations/consumers",
             );
             "common".to_string()
         }
@@ -166,7 +213,7 @@ pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<C
         Some(v) if v.eq_ignore_ascii_case("Tasks.ReadWrite") => ScopeChoice::ReadWrite,
         Some(v) if v.eq_ignore_ascii_case("Tasks.Read") => ScopeChoice::Read,
         Some(_) => {
-            issues.push("TODO_MCP_SCOPE must be Tasks.ReadWrite or Tasks.Read".to_string());
+            reject("TODO_MCP_SCOPE", "must be Tasks.ReadWrite or Tasks.Read");
             ScopeChoice::ReadWrite
         }
     };
@@ -180,8 +227,9 @@ pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<C
         Some("1" | "true" | "yes") => true,
         Some("0" | "false" | "no") => false,
         Some(_) => {
-            issues.push(
-                "TODO_MCP_START_WITHOUT_TOKEN must be 1, 0, true, false, yes or no".to_string(),
+            reject(
+                "TODO_MCP_START_WITHOUT_TOKEN",
+                "must be 1, 0, true, false, yes or no",
             );
             false
         }
@@ -192,8 +240,9 @@ pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<C
         Some(v) => match is_valid_iana(&v) {
             Some(tz) => Some(tz),
             None => {
-                issues.push(
-                    "TODO_MCP_TZ must be an IANA zone name such as Europe/Prague".to_string(),
+                reject(
+                    "TODO_MCP_TZ",
+                    "must be an IANA zone name such as Europe/Prague",
                 );
                 None
             }
@@ -205,19 +254,20 @@ pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<C
         Some(v) => match v.parse::<SocketAddr>() {
             Ok(a) => a,
             Err(_) => {
-                issues.push("TODO_MCP_BIND must be an <ip>:<port> socket address".to_string());
+                reject("TODO_MCP_BIND", "must be an <ip>:<port> socket address");
                 SocketAddr::from(([0, 0, 0, 0], 8591))
             }
         },
     };
 
-    let data_dir = match var("TODO_MCP_DATA_DIR") {
+    let data_dir = match var("TODO_MCP_DATA_DIR").map(PathBuf::from) {
         None => PathBuf::from("/data"),
-        Some(v) => PathBuf::from(v),
+        Some(p) if p.is_absolute() => p,
+        Some(_) => {
+            reject("TODO_MCP_DATA_DIR", "must be an absolute path");
+            PathBuf::from("/data")
+        }
     };
-    if !data_dir.is_absolute() {
-        issues.push("TODO_MCP_DATA_DIR must be an absolute path".to_string());
-    }
 
     let bearer_file = match var("TODO_MCP_BEARER_FILE") {
         None => data_dir.join("bearer.token"),
@@ -233,13 +283,13 @@ pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<C
         })
         .unwrap_or_default();
 
-    let mut int = |key: &str, default: u64, lo: u64, hi: u64| -> u64 {
+    let mut int = |key: &'static str, default: u64, lo: u64, hi: u64| -> u64 {
         match var(key) {
             None => default,
             Some(v) => match v.parse::<u64>() {
                 Ok(n) if (lo..=hi).contains(&n) => n,
                 _ => {
-                    issues.push(format!("{key} must be an integer in {lo}..={hi}"));
+                    reject(key, &format!("must be an integer in {lo}..={hi}"));
                     default
                 }
             },
@@ -269,10 +319,7 @@ pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<C
         4 * 1024 * 1024,
     ) as usize;
 
-    if !issues.is_empty() {
-        return Err(AppError::Config(issues.join("; ")));
-    }
-    Ok(Config {
+    let config = Config {
         client_id,
         tenant,
         scope,
@@ -293,7 +340,8 @@ pub fn load_config(get: impl Fn(&str) -> Option<String>, need: Need) -> Result<C
         // The sync must finish inside the tool deadline with room left to render.
         sync_timeout_ms: sync_timeout_ms.min(tool_deadline_ms),
         tool_result_max_bytes,
-    })
+    };
+    Resolved { config, issues }
 }
 
 /// A GUID in canonical 8-4-4-4-12 form. Entra only issues that shape; anything
@@ -470,6 +518,88 @@ mod tests {
             assert!(msg.contains(key), "{key}: {msg}");
             assert!(!msg.contains(value), "{key} echoed its value: {msg}");
         }
+    }
+
+    /// `doctor` reports each issue alone and keeps using the rest, so an issue
+    /// must name exactly its variable, and the partial `Config` must hold the
+    /// default in place of the value, never the value itself.
+    #[test]
+    fn every_rejected_value_is_its_own_issue_and_falls_back_to_its_default() {
+        let get = |vars: Vec<(&'static str, &'static str)>| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| (*v).to_string())
+            }
+        };
+        let defaults = load(&[("TODO_MCP_CLIENT_ID", ID)]).unwrap();
+        let cases: [(&str, &str); 9] = [
+            ("TODO_MCP_CLIENT_ID", "not-a-guid-SECRETVALUE"),
+            ("TODO_MCP_SCOPE", "Mail.ReadWrite"),
+            ("TODO_MCP_TZ", "Mars/Olympus_Mons"),
+            ("TODO_MCP_BIND", "secret-host.example:x"),
+            ("TODO_MCP_GRAPH_CONCURRENCY", "8"),
+            ("TODO_MCP_MAX_PAGES", "99999999"),
+            ("TODO_MCP_TENANT", "bad tenant/value"),
+            ("TODO_MCP_DATA_DIR", "relative/secret-path"),
+            ("TODO_MCP_START_WITHOUT_TOKEN", "maybe"),
+        ];
+        for (key, value) in cases {
+            let resolved = resolve_config(
+                get(vec![(key, value), ("TODO_MCP_CLIENT_ID", ID)]),
+                Need::ClientId,
+            );
+            let [issue] = resolved.issues.as_slice() else {
+                panic!("{key}: expected one issue, got {:?}", resolved.issues);
+            };
+            assert_eq!(issue.var, key, "{issue:?}");
+            assert!(issue.message.starts_with(key), "{issue:?}");
+            assert!(!issue.message.contains(value), "{key} echoed: {issue:?}");
+            assert!(resolved.rejected(key), "{key}: {issue:?}");
+            let expected = if key == "TODO_MCP_CLIENT_ID" {
+                Config {
+                    client_id: String::new(),
+                    ..defaults.clone()
+                }
+            } else {
+                defaults.clone()
+            };
+            assert_eq!(resolved.config, expected, "{key} did not fall back");
+        }
+    }
+
+    /// Every caller but `doctor` refuses on the same issues, joined as before.
+    #[test]
+    fn load_config_refuses_with_exactly_the_issues_resolve_config_collected() {
+        let vars = [
+            ("TODO_MCP_CLIENT_ID", ID),
+            ("TODO_MCP_TZ", "Mars/Olympus_Mons"),
+            ("TODO_MCP_TENANT", "bad tenant/value"),
+            ("TODO_MCP_MAX_PAGES", "0"),
+        ];
+        let get = |k: &str| {
+            vars.iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| (*v).to_string())
+        };
+        let resolved = resolve_config(get, Need::ClientId);
+        let names: Vec<&str> = resolved.issues.iter().map(|i| i.var).collect();
+        assert_eq!(
+            names,
+            ["TODO_MCP_TENANT", "TODO_MCP_TZ", "TODO_MCP_MAX_PAGES"],
+            "{:?}",
+            resolved.issues
+        );
+        assert!(!resolved.rejected("TODO_MCP_CLIENT_ID"));
+        let err = load_config(get, Need::ClientId).unwrap_err();
+        assert_eq!(err.code(), "CONFIG");
+        assert_eq!(
+            err.message(),
+            format!(
+                "Invalid configuration — {}; {}; {}",
+                resolved.issues[0].message, resolved.issues[1].message, resolved.issues[2].message
+            )
+        );
     }
 
     #[test]

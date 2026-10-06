@@ -205,8 +205,8 @@ hand-rolls a fixture Entra/Graph server on `tiny_http` (already a dependency), s
    filter typo: the log-hygiene parents assert the child's stdout says `1 passed`, and
    the shutdown tests wait for the child's own log lines before signalling it.
 
-**229 tests per run: 119 unit** (in the lib; `main.rs` has none) **and 110
-integration** — cli_smoke 10, graph_client 12, http_auth 2, shutdown 8 (one is the
+**234 tests per run: 121 unit** (in the lib; `main.rs` has none) **and 113
+integration** — cli_smoke 13, graph_client 12, http_auth 2, shutdown 8 (one is the
 `child_process_entry` body, a no-op outside the child), token_store 19, tools_read 35,
 tools_write 24 — and 0 doctests. The count is the same under the host zone, under
 `TZ=Pacific/Kiritimati` and inside `docker build --target test .`.
@@ -349,7 +349,7 @@ and can print a task title.
 ## Status and where to start
 
 **Implemented and tested offline.** `auth/`, `graph/`, `domain/`, `cache.rs`,
-`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 229
+`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 234
 tests (see Tests) pass under the host zone, under `TZ=Pacific/Kiritimati` and inside
 `docker build --target test .`, with clippy `-D warnings`, `cargo fmt --check` and
 the ten gates green.

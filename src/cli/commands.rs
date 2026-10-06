@@ -18,7 +18,7 @@ use crate::auth::{
     scope_short_names, stored_forbidden_scope_message, vet_grant,
 };
 use crate::clock::SystemClock;
-use crate::config::{Config, Need, ScopeChoice, load_config, validate_data_dir};
+use crate::config::{Config, Need, ScopeChoice, load_config, resolve_config, validate_data_dir};
 use crate::errors::{AppError, LOGIN_HINT, RESTART_HINT};
 use crate::graph::client::{GraphClient, UreqTransport};
 use crate::http::{self, HttpGuards};
@@ -509,7 +509,25 @@ pub fn healthcheck() -> Result<i32, AppError> {
 
 // ---------------------------------------------------------------------------
 
-/// Never refuses to run: every problem is a finding plus remediation.
+/// What a configuration line shows for a rejected variable, in place of the
+/// default that replaced it.
+const REJECTED: &str = "rejected (see FINDING above)";
+
+/// The data directory and token store sections without a usable data dir.
+const DIR_SKIPPED: &str = "  skipped: TODO_MCP_DATA_DIR was rejected above";
+
+/// What the live refresh and the Graph calls cannot run without. Any other
+/// rejected variable falls back to a default that is harmless for them.
+const GRAPH_NEEDS: [&str; 4] = [
+    "TODO_MCP_CLIENT_ID",
+    "TODO_MCP_TENANT",
+    "TODO_MCP_SCOPE",
+    "TODO_MCP_DATA_DIR",
+];
+
+/// Never refuses to run: every problem is a finding plus remediation. Each
+/// rejected variable is its own finding, and the report goes on; a section that
+/// needs a rejected value says it was skipped instead of using the default.
 pub fn doctor(verbose: bool) -> Result<i32, AppError> {
     let mut findings = 0usize;
     let mut finding = |msg: &str| {
@@ -519,16 +537,22 @@ pub fn doctor(verbose: bool) -> Result<i32, AppError> {
     out::line(&format!("todo-mcp {} doctor", env!("CARGO_PKG_VERSION")));
     out::line("");
     out::line("configuration");
-    let cfg = match load_config(env, Need::NoClientId) {
-        Ok(c) => c,
-        Err(e) => {
-            finding(&e.message());
-            out::line("");
-            out::line("Fix the configuration above and run doctor again.");
-            return Ok(exit::ERROR);
+    let resolved = resolve_config(env, Need::NoClientId);
+    for issue in &resolved.issues {
+        finding(&issue.message);
+    }
+    let cfg = &resolved.config;
+    let rejected = |var: &str| resolved.rejected(var);
+    let shown = |var: &str, value: String| {
+        if rejected(var) {
+            REJECTED.to_string()
+        } else {
+            value
         }
     };
-    if cfg.client_id.is_empty() {
+    if rejected("TODO_MCP_CLIENT_ID") {
+        out::line(&format!("  client id:     {REJECTED}"));
+    } else if cfg.client_id.is_empty() {
         finding("TODO_MCP_CLIENT_ID is unset — see docs/app-registration.md");
     } else {
         let tail: String = cfg
@@ -542,13 +566,24 @@ pub fn doctor(verbose: bool) -> Result<i32, AppError> {
             .collect();
         out::line(&format!("  client id:     …{tail}"));
     }
-    out::line(&format!("  authority:     {}", cfg.authority()));
     out::line(&format!(
-        "  scope:         {} (requested: {})",
-        cfg.scope.short(),
-        cfg.scope.requested()
+        "  authority:     {}",
+        shown("TODO_MCP_TENANT", cfg.authority())
+    ));
+    out::line(&format!(
+        "  scope:         {}",
+        shown(
+            "TODO_MCP_SCOPE",
+            format!(
+                "{} (requested: {})",
+                cfg.scope.short(),
+                cfg.scope.requested()
+            )
+        )
     ));
     match cfg.tz {
+        // Not also the "unset" finding: the issue above is the one report.
+        _ if rejected("TODO_MCP_TZ") => out::line(&format!("  timezone:      {REJECTED}")),
         Some(tz) => out::line(&format!(
             "  timezone:      {} (Windows name for writes: {})",
             tz.name(),
@@ -557,26 +592,59 @@ pub fn doctor(verbose: bool) -> Result<i32, AppError> {
         )),
         None => finding(TZ_WARNING),
     }
-    out::line(&format!("  bind:          {}", cfg.bind));
-    out::line(&format!("  data dir:      {}", cfg.data_dir.display()));
+    out::line(&format!(
+        "  bind:          {}",
+        shown("TODO_MCP_BIND", cfg.bind.to_string())
+    ));
+    out::line(&format!(
+        "  data dir:      {}",
+        shown("TODO_MCP_DATA_DIR", cfg.data_dir.display().to_string())
+    ));
     if verbose {
         out::line(&format!(
-            "  graph:         concurrency {}, max pages {}, attempts {}, http timeout {} ms, tool deadline {} ms, response cap {} B",
-            cfg.graph_concurrency,
-            cfg.max_pages,
-            cfg.max_attempts,
-            cfg.http_timeout_ms,
-            cfg.tool_deadline_ms,
-            cfg.max_response_bytes
+            "  graph:         concurrency {}, max pages {}, attempts {}, http timeout {}, tool deadline {}, response cap {}",
+            shown(
+                "TODO_MCP_GRAPH_CONCURRENCY",
+                cfg.graph_concurrency.to_string()
+            ),
+            shown("TODO_MCP_MAX_PAGES", cfg.max_pages.to_string()),
+            shown("TODO_MCP_MAX_ATTEMPTS", cfg.max_attempts.to_string()),
+            shown(
+                "TODO_MCP_HTTP_TIMEOUT_MS",
+                format!("{} ms", cfg.http_timeout_ms)
+            ),
+            shown(
+                "TODO_MCP_TOOL_DEADLINE_MS",
+                format!("{} ms", cfg.tool_deadline_ms)
+            ),
+            shown(
+                "TODO_MCP_MAX_RESPONSE_BYTES",
+                format!("{} B", cfg.max_response_bytes)
+            )
         ));
         out::line(&format!(
-            "  cache:         ttl {} s, max tasks {}, sync timeout {} ms, result cap {} B",
-            cfg.cache_ttl_seconds,
-            cfg.cache_max_tasks,
-            cfg.sync_timeout_ms,
-            cfg.tool_result_max_bytes
+            "  cache:         ttl {}, max tasks {}, sync timeout {}, result cap {}",
+            shown(
+                "TODO_MCP_CACHE_TTL_SECONDS",
+                format!("{} s", cfg.cache_ttl_seconds)
+            ),
+            shown("TODO_MCP_CACHE_MAX_TASKS", cfg.cache_max_tasks.to_string()),
+            shown(
+                "TODO_MCP_SYNC_TIMEOUT_MS",
+                format!("{} ms", cfg.sync_timeout_ms)
+            ),
+            shown(
+                "TODO_MCP_TOOL_RESULT_MAX_BYTES",
+                format!("{} B", cfg.tool_result_max_bytes)
+            )
         ));
-        out::line(&format!("  bearer file:   {}", cfg.bearer_file.display()));
+        // The default bearer path derives from the data dir, rejected or not.
+        let bearer_file = if cfg.bearer_file == cfg.data_dir.join("bearer.token") {
+            shown("TODO_MCP_DATA_DIR", cfg.bearer_file.display().to_string())
+        } else {
+            cfg.bearer_file.display().to_string()
+        };
+        out::line(&format!("  bearer file:   {bearer_file}"));
         out::line(&format!(
             "  allowed hosts: localhost, 127.0.0.1, [::1]{}",
             cfg.allowed_hosts
@@ -586,93 +654,126 @@ pub fn doctor(verbose: bool) -> Result<i32, AppError> {
         ));
     }
 
+    // Without a usable data dir, validate_data_dir would probe, and create, the
+    // fallback /data: not the directory the operator meant.
+    let dir_usable = !rejected("TODO_MCP_DATA_DIR");
+    let graph_blockers: Vec<&str> = GRAPH_NEEDS.into_iter().filter(|v| rejected(v)).collect();
+    // The live refresh's one gate. The token store audits the stored scope
+    // offline exactly when it is closed, so one cause is never counted twice.
+    let refresh_runs = |f: &TokenFile| {
+        graph_blockers.is_empty()
+            && !cfg.client_id.is_empty()
+            && f.client_id == cfg.client_id
+            && f.requested_scope == cfg.scope.requested()
+    };
+
     out::line("");
     out::line("data directory");
-    match validate_data_dir(&cfg.data_dir) {
-        Ok(r) => {
-            out::line(&format!(
-                "  path:  {}  owner {}:{}  mode {:04o}  writable",
-                r.path.display(),
-                r.uid,
-                r.gid,
-                r.mode
-            ));
-            if let Some(w) = r.loose_mode_warning {
-                finding(&w);
+    if dir_usable {
+        match validate_data_dir(&cfg.data_dir) {
+            Ok(r) => {
+                out::line(&format!(
+                    "  path:  {}  owner {}:{}  mode {:04o}  writable",
+                    r.path.display(),
+                    r.uid,
+                    r.gid,
+                    r.mode
+                ));
+                if let Some(w) = r.loose_mode_warning {
+                    finding(&w);
+                }
             }
+            Err(e) => finding(&e.message()),
         }
-        Err(e) => finding(&e.message()),
+        let bearer_state = match std::fs::metadata(&cfg.bearer_file) {
+            Ok(_) => "present".to_string(),
+            Err(_) => "absent (generated on first `token` or `serve`)".to_string(),
+        };
+        out::line(&format!("  bearer: {bearer_state}"));
+    } else {
+        out::line(DIR_SKIPPED);
     }
-    let bearer_state = match std::fs::metadata(&cfg.bearer_file) {
-        Ok(_) => "present".to_string(),
-        Err(_) => "absent (generated on first `token` or `serve`)".to_string(),
-    };
-    out::line(&format!("  bearer: {bearer_state}"));
 
     out::line("");
     out::line("token store");
-    let file = match store::load(&cfg.data_dir) {
-        Ok(f) => {
-            let mode = store::token_file_mode(&cfg.data_dir).unwrap_or(0);
-            out::line(&format!(
-                "  token.json: present, mode {mode:04o}, obtained {} by {}",
-                f.obtained_at, f.obtained_by
-            ));
-            out::line(&format!(
-                "  granted scopes (at last write): {}",
-                scope_short_names(&f.granted_scope).join(" ")
-            ));
-            if mode & 0o077 != 0 {
-                finding(&format!(
-                    "token.json mode is {mode:04o}; expected 0600. Fix: chmod 600 {}",
-                    cfg.token_path().display()
+    let file = if !dir_usable {
+        out::line(DIR_SKIPPED);
+        None
+    } else {
+        match store::load(&cfg.data_dir) {
+            Ok(f) => {
+                let mode = store::token_file_mode(&cfg.data_dir).unwrap_or(0);
+                out::line(&format!(
+                    "  token.json: present, mode {mode:04o}, obtained {} by {}",
+                    f.obtained_at, f.obtained_by
                 ));
-            }
-            if !cfg.client_id.is_empty() && f.client_id != cfg.client_id {
-                finding(&format!(
-                    "token.json was issued to a different TODO_MCP_CLIENT_ID. Fix: {LOGIN_HINT}."
+                out::line(&format!(
+                    "  granted scopes (at last write): {}",
+                    scope_short_names(&f.granted_scope).join(" ")
                 ));
-            }
-            if f.requested_scope != cfg.scope.requested() {
-                finding(&format!(
-                    "TODO_MCP_SCOPE differs from the scope token.json was obtained with. Fix: {LOGIN_HINT}."
-                ));
-            }
-            // The stored scope is audited offline ONLY when the live refresh below
-            // is skipped (the negation of its gate). When it runs, its vet_grant
-            // result is the single report, so one cause is never counted twice.
-            let live_refresh_runs = !cfg.client_id.is_empty()
-                && f.client_id == cfg.client_id
-                && f.requested_scope == cfg.scope.requested();
-            if !live_refresh_runs {
-                let audit = audit_scope(&f.granted_scope, &cfg.scope.requested());
-                if !audit.forbidden.is_empty() {
-                    finding(&stored_forbidden_scope_message(&audit.forbidden));
+                if mode & 0o077 != 0 {
+                    finding(&format!(
+                        "token.json mode is {mode:04o}; expected 0600. Fix: chmod 600 {}",
+                        cfg.token_path().display()
+                    ));
                 }
-                if let Some(w) = audit.warning() {
-                    out::line(&format!("  WARNING  {w}"));
+                if !cfg.client_id.is_empty() && f.client_id != cfg.client_id {
+                    finding(&format!(
+                        "token.json was issued to a different TODO_MCP_CLIENT_ID. Fix: {LOGIN_HINT}."
+                    ));
                 }
+                if !rejected("TODO_MCP_SCOPE") && f.requested_scope != cfg.scope.requested() {
+                    finding(&format!(
+                        "TODO_MCP_SCOPE differs from the scope token.json was obtained with. Fix: {LOGIN_HINT}."
+                    ));
+                }
+                // The stored scope is audited offline ONLY when the live refresh below
+                // is skipped (the negation of its gate). When it runs, its vet_grant
+                // result is the single report, so one cause is never counted twice.
+                if !refresh_runs(&f) {
+                    // A rejected TODO_MCP_SCOPE holds the default, not the operator's
+                    // ceiling; the scope token.json was requested with is the best
+                    // stand-in.
+                    let requested = if rejected("TODO_MCP_SCOPE") {
+                        f.requested_scope.clone()
+                    } else {
+                        cfg.scope.requested()
+                    };
+                    let audit = audit_scope(&f.granted_scope, &requested);
+                    if !audit.forbidden.is_empty() {
+                        finding(&stored_forbidden_scope_message(&audit.forbidden));
+                    }
+                    if let Some(w) = audit.warning() {
+                        out::line(&format!("  WARNING  {w}"));
+                    }
+                }
+                Some(f)
             }
-            Some(f)
-        }
-        Err(store::StoreError::NotFound) => {
-            finding(&format!("no token.json — not signed in. Fix: {LOGIN_HINT}"));
-            None
-        }
-        Err(e) => {
-            finding(&e.to_string());
-            None
+            Err(store::StoreError::NotFound) => {
+                finding(&format!("no token.json — not signed in. Fix: {LOGIN_HINT}"));
+                None
+            }
+            Err(e) => {
+                finding(&e.to_string());
+                None
+            }
         }
     };
 
-    if let Some(f) = file
-        && !cfg.client_id.is_empty()
-        && f.client_id == cfg.client_id
-        && f.requested_scope == cfg.scope.requested()
+    if !graph_blockers.is_empty() {
+        // Not a finding: each rejected variable was already counted above.
+        out::line("");
+        out::line("microsoft graph");
+        out::line(&format!(
+            "  skipped: {} rejected above; the token refresh and the Graph calls need a valid client id, tenant, scope and data directory",
+            graph_blockers.join(", ")
+        ));
+    } else if let Some(f) = file
+        && refresh_runs(&f)
     {
         out::line("");
         out::line("microsoft graph");
-        let tokens = Arc::new(token_provider(&cfg, ProviderMode::OneShot));
+        let tokens = Arc::new(token_provider(cfg, ProviderMode::OneShot));
         match tokens.access_token() {
             Ok(_) => {
                 let st = tokens.status();

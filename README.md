@@ -16,7 +16,7 @@ nothing else.
 >
 > | | |
 > |---|---|
-> | **Test suite** | 229 tests (119 unit, 110 integration) against a hand-rolled fixture Entra/Graph server. Green under the host time zone and under `TZ=Pacific/Kiritimati`, and inside `docker build --target test .` |
+> | **Test suite** | 234 tests (121 unit, 113 integration) against a hand-rolled fixture Entra/Graph server. Green under the host time zone and under `TZ=Pacific/Kiritimati`, and inside `docker build --target test .` |
 > | **Release image** | Built for `linux/amd64` and `linux/arm64` through the size gate, and checked on macOS arm64 Docker Desktop: user `65534:65534`, `/data` volume, healthcheck, no shell. A compose run with a fake client ID showed a fresh named volume's `/data` owned `65534:65534` mode `0700` (Docker Desktop keeps named volumes on ext4 inside its Linux VM; only bind mounts go through VirtioFS), and the `Restarting (3)` refusal without a sign-in |
 > | **Linux** | CI's `Release image` job asserts that first-mount ownership again on the amd64 image on a native Linux engine, and is the only evidence for `docker stop` during boot exiting 0 within 2 s (as PID 1, no init). Stopping a running server, and its drain, are tested on the host by `tests/shutdown.rs` |
 > | **Never done** | A run against a real Microsoft account. The live-Graph assumptions — `$batch` on `/me/todo/*`, whether `null` clears a due date, which Windows zone names a date write accepts, the exact scopes Microsoft grants — are still assumptions. [CHANGELOG.md](CHANGELOG.md) lists them all |
@@ -277,8 +277,11 @@ granted scopes read back from Microsoft (with a warning for any this server does
 use), **your list names and, when `TODO_MCP_TZ` is set, one real task's title** with
 its raw due date beside the interpreted local date. That last line is the only way to
 notice a *valid but wrong* `TODO_MCP_TZ`. It names the fix for anything it detects,
-exits 1 when it found something, and never refuses to run (an invalid configuration is
-reported as a finding and ends the report). Under `docker compose run`, the service's `json-file` log driver
+exits 1 when it found something, and never refuses to run. Each invalid setting is its
+own finding, and the report goes on with the data directory and token store checks; the
+Microsoft Graph check is skipped, saying why, while the client ID, tenant, scope or data
+directory is invalid, and an invalid `TODO_MCP_DATA_DIR` skips the data directory and
+token store checks too. Under `docker compose run`, the service's `json-file` log driver
 records that output on the Docker host until the `--rm` container is removed; to avoid
 it, run `doctor` from a host build or with `docker run --rm --log-driver none`
 ([SECURITY.md](SECURITY.md#doctor-and-login-print-to-stdout-and-docker-may-keep-it)
