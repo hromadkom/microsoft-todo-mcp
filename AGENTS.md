@@ -73,6 +73,15 @@ leaves, importing no crate module: clock, errors, logger, mcp, sem
 - **Two credentials, never conflated.** The inbound MCP bearer guards `/mcp`; a
   separate expiring OAuth token guards outbound Graph. The bearer is never
   forwarded to Graph and a Graph token is never accepted as MCP auth.
+- **`bearer.token` is published, never written in place**
+  (`cli/commands.rs::load_or_create_bearer`, #14). `serve` and `token` can create it
+  at the same moment, and `serve` enforces the value it returned, so exactly one
+  creator may win: a new bearer is written and synced to a `bearer.token.tmp.*`
+  beside it, then `hard_link`ed, which fails with `AlreadyExists` and makes the
+  loser re-read. An empty file is replaced by a `rename` under a flock on that
+  file, after checking the path still names it. `BearerDraft`'s `Drop` removes the
+  temp name on every exit. `create(true).truncate(true)` or a bare `rename` would
+  bring the race back; the concurrency tests in `cli/commands.rs` catch both.
 - **The `Authorization` header is named in exactly two files.** `graph/client.rs`
   sets the outbound one and `http.rs` reads the inbound one; gate 3 allows nothing
   else, so do not name it in a `src/` test either.
@@ -205,7 +214,7 @@ hand-rolls a fixture Entra/Graph server on `tiny_http` (already a dependency), s
    filter typo: the log-hygiene parents assert the child's stdout says `1 passed`, and
    the shutdown tests wait for the child's own log lines before signalling it.
 
-**234 tests per run: 121 unit** (in the lib; `main.rs` has none) **and 113
+**237 tests per run: 124 unit** (in the lib; `main.rs` has none) **and 113
 integration** — cli_smoke 13, graph_client 12, http_auth 2, shutdown 8 (one is the
 `child_process_entry` body, a no-op outside the child), token_store 19, tools_read 35,
 tools_write 24 — and 0 doctests. The count is the same under the host zone, under
@@ -349,7 +358,7 @@ and can print a task title.
 ## Status and where to start
 
 **Implemented and tested offline.** `auth/`, `graph/`, `domain/`, `cache.rs`,
-`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 234
+`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 237
 tests (see Tests) pass under the host zone, under `TZ=Pacific/Kiritimati` and inside
 `docker build --target test .`, with clippy `-D warnings`, `cargo fmt --check` and
 the ten gates green.

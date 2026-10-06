@@ -45,9 +45,9 @@ directory they cannot write.
 | File | What it is | Protection |
 |---|---|---|
 | `token.json` | Your Microsoft sign-in: one delegated **refresh token**, stored **in plaintext**, plus the client ID, authority and scopes it belongs to. The access token is never written to disk. | Created mode `0600` through a temporary file in the same directory and an atomic rename. It is **not encrypted**. Protect the volume and treat the file like a password. |
-| `bearer.token` | The inbound MCP bearer your clients send to `/mcp`: 32 random bytes, hex-encoded. It is a **local** credential, unrelated to your Microsoft account, and is never sent to Microsoft. | Created mode `0600` when the server generates it (on the first `token` or `serve`). If `TODO_MCP_BEARER_FILE` points at a file you supply, the server reads it as-is and does **not** check its mode or owner. |
+| `bearer.token` | The inbound MCP bearer your clients send to `/mcp`: 32 random bytes, hex-encoded. It is a **local** credential, unrelated to your Microsoft account, and is never sent to Microsoft. | Created mode `0600` when the server generates it (on the first `token` or `serve`): written to a temporary file in the same directory, then published with a hard link, which fails if the file already exists. A `token` and a `serve` started together therefore end up with the same value, and neither can read a half-written file. An empty `bearer.token`, such as an interrupted write leaves behind, is replaced by renaming a new temporary file over it while holding a lock on the empty file, so one process replaces it and the others adopt the new value; it comes back mode `0600`. If `TODO_MCP_BEARER_FILE` points at a file you supply, the server reads it as-is and does **not** check its mode or owner. |
 | `.token.lock` | An empty lock file. Every read and write of `token.json` takes an exclusive lock on it, so a `login` and a running server's refresh cannot overwrite each other. | Created mode `0600`. Holds no secret. Nothing removes it, neither `logout` nor a dead-token deletion: unlinking a lock file another process holds would let two processes in at once. |
-| `token.json.tmp.*` | Short-lived files from the atomic write. | Created mode `0600`. |
+| `token.json.tmp.*`, `bearer.token.tmp.*` | Short-lived files from the atomic writes. | Created mode `0600`. A `bearer.token.tmp.*` is removed on every exit from the write, error paths included; only a process killed mid-write leaves one behind, and it is never read. |
 
 Consequences:
 
@@ -217,8 +217,6 @@ These are known and tracked. Report anything else.
 
 - A panic message is logged with its payload, which could include task content if a
   future bug panics while formatting it.
-- `bearer.token` is not created exclusively. A file that already exists but is empty
-  is overwritten in place and keeps its existing mode.
 - The server has never run against a live Microsoft account. The scope strings
   Microsoft actually grants to personal and to work accounts, which `auth::vet_grant`
   judges, have not been recorded.
