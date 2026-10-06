@@ -78,13 +78,18 @@ leaves, importing no crate module: clock, errors, logger, mcp, sem
   the value it returned. An absent file is written and synced to a
   `bearer.token.tmp.*` beside it, then `hard_link`ed into place; `AlreadyExists`
   makes the loser re-read and adopt. An empty or blank file is filled **in place**
-  under a flock on it, after checking the path still names the locked file: a
-  rename would replace a single-file bind mount (EBUSY) or a symlink, and needs a
-  writable directory. Its fd is read+write, which an exclusive flock needs on NFS.
-  `create(true).truncate(true)` or `rename` for the create, a rename for the fill,
-  or a missing lock or inode check each fail a deterministic test in
-  `cli/commands.rs`, on one CPU too. The 8-thread stress tests need two CPUs to
-  catch a lost race.
+  under an exclusive flock on it, after checking the path still names the locked
+  file, then re-reading it: a rename would replace a single-file bind mount (EBUSY)
+  or a symlink, and needs a writable directory. Its fd is read+write, which an
+  exclusive flock needs on NFS. **Every read takes the shared flock**
+  (`read_bearer`): `read_to_string` reads more than once, and an unlocked read of a
+  `"\n"` file can glue it to the tail of the bearer being written and adopt a
+  63-character one. `read_bearer` closes its fd before the caller can take the
+  exclusive lock on another; a process holding both would wait on itself. Each
+  step has its own test in `cli/commands.rs` that fails without it, on one CPU too:
+  `hard_link`, the fill in place, the exclusive lock, the inode check, the locked
+  re-read and the shared read. The 8-thread stress tests need two CPUs to catch a
+  lost race.
 - **The `Authorization` header is named in exactly two files.** `graph/client.rs`
   sets the outbound one and `http.rs` reads the inbound one; gate 3 allows nothing
   else, so do not name it in a `src/` test either.
@@ -217,7 +222,7 @@ hand-rolls a fixture Entra/Graph server on `tiny_http` (already a dependency), s
    filter typo: the log-hygiene parents assert the child's stdout says `1 passed`, and
    the shutdown tests wait for the child's own log lines before signalling it.
 
-**240 tests per run: 127 unit** (in the lib; `main.rs` has none) **and 113
+**242 tests per run: 129 unit** (in the lib; `main.rs` has none) **and 113
 integration** — cli_smoke 13, graph_client 12, http_auth 2, shutdown 8 (one is the
 `child_process_entry` body, a no-op outside the child), token_store 19, tools_read 35,
 tools_write 24 — and 0 doctests. The count is the same under the host zone, under
@@ -361,7 +366,7 @@ and can print a task title.
 ## Status and where to start
 
 **Implemented and tested offline.** `auth/`, `graph/`, `domain/`, `cache.rs`,
-`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 240
+`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 242
 tests (see Tests) pass under the host zone, under `TZ=Pacific/Kiritimati` and inside
 `docker build --target test .`, with clippy `-D warnings`, `cargo fmt --check` and
 the ten gates green.

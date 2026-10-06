@@ -70,11 +70,13 @@ enum Bearer {
 ///   loser re-reads and adopts the winner's file, and no reader can find it
 ///   half-written;
 /// - an empty or blank file (an interrupted write, or one an operator made) is
-///   filled in place under a flock on it, keeping its inode, owner and mode, so a
-///   bind-mounted file or a symlink's target is filled rather than replaced.
+///   filled in place under an exclusive flock on it, keeping its inode, owner and
+///   mode, so a bind-mounted file or a symlink's target is filled rather than
+///   replaced. Every read takes the shared flock, so it sees the file blank before
+///   a fill or whole after it.
 fn settle_bearer(path: &Path) -> Result<Bearer, AppError> {
     for _ in 0..BEARER_ATTEMPTS {
-        let settled = match std::fs::read_to_string(path) {
+        let settled = match read_bearer(path) {
             Ok(s) if !s.trim().is_empty() => return Ok(Bearer::Found(s.trim().to_string())),
             Ok(_) => fill_blank_bearer(path)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_bearer(path)?,
@@ -88,6 +90,24 @@ fn settle_bearer(path: &Path) -> Result<Bearer, AppError> {
         "cannot create bearer file {} (the path kept changing while it was created; a dangling symlink there never resolves)",
         path.display()
     )))
+}
+
+/// Read the bearer under a shared flock. A fill holds the exclusive one from its
+/// truncate through its write, sync and any rollback, and `read_to_string` reads
+/// more than once: unlocked, it could stitch a blank file's bytes onto the tail of
+/// the bearer being written, or adopt one that is about to be rolled back. The fd
+/// and its lock close on return, before the caller may take the exclusive lock on
+/// another fd, which would otherwise wait for this one forever.
+fn read_bearer(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut f = std::fs::File::open(path)?;
+    // Where flock fails, the fill's exclusive lock fails too, so no fill can run
+    // under this read; a bearer already there is still served.
+    let _ = f.lock_shared();
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(s)
 }
 
 /// The path is absent: publish a new bearer only if it still is. `None` means
@@ -114,29 +134,30 @@ fn create_bearer(path: &Path) -> Result<Option<Bearer>, AppError> {
 }
 
 /// The path holds an empty or blank file. Exactly one process fills it: each takes
-/// a flock on the file, and once it holds the lock, checks that the path still
-/// names that file and that the file is still blank. A process that waited finds
-/// it filled and adopts the value, or finds it replaced and returns `None` for the
-/// caller to re-read.
-///
-/// The fill truncates, then writes the whole bearer in one call, so a reader that
-/// takes no lock sees the file blank (which sends it here to wait) or whole: the
-/// size that covers a write is published after its bytes.
+/// an exclusive flock on the file, and once it holds the lock, checks that the path
+/// still names that file and that the file is still blank. A process that waited
+/// finds it filled and adopts the value, or finds it replaced and returns `None`
+/// for the caller to re-read.
 fn fill_blank_bearer(path: &Path) -> Result<Option<Bearer>, AppError> {
-    use std::io::Read as _;
-    use std::os::unix::fs::{FileExt, MetadataExt};
-
     // Writable because the fill writes through it, which is also what an exclusive
     // flock needs on NFS, where it is emulated with a POSIX lock.
-    let mut blank = match std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
     {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(bearer_unwritable(path, &e)),
-    };
+        Ok(blank) => fill_opened_bearer(path, blank),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(bearer_unwritable(path, &e)),
+    }
+}
+
+/// [`fill_blank_bearer`] from the lock on: `blank` is the file as it was opened,
+/// whatever `path` names by the time the lock is held.
+fn fill_opened_bearer(path: &Path, mut blank: std::fs::File) -> Result<Option<Bearer>, AppError> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{FileExt, MetadataExt};
+
     blank.lock().map_err(|e| bearer_unwritable(path, &e))?;
     let held = blank.metadata().map_err(|e| bearer_unreadable(path, &e))?;
     match std::fs::metadata(path) {
@@ -165,7 +186,8 @@ fn fill_blank_bearer(path: &Path) -> Result<Option<Bearer>, AppError> {
         .and_then(|()| blank.write_all_at(token.as_bytes(), 0))
         .and_then(|()| blank.sync_all());
     if let Err(e) = filled {
-        // Blank again, never a partial bearer that the next read would adopt.
+        // Blank again, never a partial bearer. No reader saw the written one: reads
+        // wait for this lock.
         let _ = blank.set_len(0);
         return Err(bearer_unwritable(path, &e));
     }
@@ -1186,8 +1208,8 @@ mod tests {
 
     /// Racers per round. More than `serve` + `token` ever are, so a lost race shows
     /// up within a few rounds on a machine with two or more CPUs. On one CPU a racer
-    /// often finishes inside its timeslice, which is why the deterministic tests
-    /// below pin each step of the protocol too.
+    /// often finishes inside its timeslice, which is why the tests after the two
+    /// stress tests pin each step of the protocol on its own.
     const BEARER_RACERS: usize = 8;
     const BEARER_ROUNDS: usize = 20;
 
@@ -1365,33 +1387,77 @@ mod tests {
     }
 
     #[test]
-    fn a_blank_bearer_replaced_while_waiting_for_its_lock_is_re_read() {
+    fn a_blank_bearer_replaced_before_its_lock_is_held_is_re_read() {
         let dir = bearer_dir("swapped");
         let path = dir.join("bearer.token");
         std::fs::write(&path, "").unwrap();
-        let held = std::fs::File::open(&path).unwrap();
-        held.lock().unwrap();
-        let waiter = {
-            let path = path.clone();
-            std::thread::spawn(move || fill_blank_bearer(&path).map_err(|e| e.message()))
-        };
-        // Long enough for the waiter to open the blank file and block on its lock.
-        std::thread::sleep(Duration::from_millis(100));
+        // What a waiter holds: the blank file, opened before another process
+        // replaced it, and locked only afterwards.
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         let fresh = "b".repeat(64);
         let sibling = dir.join("fresh");
         std::fs::write(&sibling, &fresh).unwrap();
         std::fs::rename(&sibling, &path).unwrap();
-        drop(held);
-        let got = waiter.join().unwrap();
-        // Filling the file it locked would return a bearer the path no longer holds.
-        match &got {
-            Ok(None) => {}
-            Ok(Some(Bearer::Found(t))) if *t == fresh => {}
-            other => panic!("the waiter did not notice the replacement: {other:?}"),
-        }
+        // Filling the file it opened would return a bearer the path no longer holds.
+        let got = fill_opened_bearer(&path, opened).map_err(|e| e.message());
+        assert!(matches!(got, Ok(None)), "{got:?}");
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert_eq!(on_disk, fresh, "the replacement was overwritten");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Holds the exclusive lock on a blank file the way a fill in progress does,
+    /// starts `run` on another thread, and checks that it is still waiting after a
+    /// while. Correct code waits for as long as the lock is held, so that check can
+    /// never fail; on a slow machine a regression may slip past it, never the reverse.
+    /// The holder then writes `fresh` into the file and lets go, and `run` returns.
+    fn while_a_fill_holds_the_lock<T: Send + 'static>(
+        tag: &str,
+        run: impl FnOnce(std::path::PathBuf) -> T + Send + 'static,
+    ) -> (T, String) {
+        use std::os::unix::fs::FileExt;
+        let dir = bearer_dir(tag);
+        let path = dir.join("bearer.token");
+        std::fs::write(&path, "  \n").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        holder.lock().unwrap();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || run(path))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "{tag}: it did not wait for the lock");
+        let fresh = "c".repeat(64);
+        holder.set_len(0).unwrap();
+        holder.write_all_at(fresh.as_bytes(), 0).unwrap();
+        drop(holder);
+        let got = waiter.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (got, fresh)
+    }
+
+    #[test]
+    fn a_bearer_fill_waits_for_the_lock_and_adopts_what_its_holder_wrote() {
+        let (got, fresh) = while_a_fill_holds_the_lock("fill-waits", |path| {
+            fill_blank_bearer(&path).map_err(|e| e.message())
+        });
+        assert_eq!(got, Ok(Some(Bearer::Found(fresh))));
+    }
+
+    #[test]
+    fn a_bearer_read_waits_out_a_fill_in_progress() {
+        let (got, fresh) = while_a_fill_holds_the_lock("read-waits", |path| {
+            read_bearer(&path).map_err(|e| e.to_string())
+        });
+        assert_eq!(got, Ok(fresh));
     }
 
     #[test]
