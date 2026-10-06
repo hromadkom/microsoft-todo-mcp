@@ -4,6 +4,7 @@
 //! variable that happens to be set in the developer's shell.
 
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -118,6 +119,218 @@ fn healthcheck_reports_invalid_configuration_as_unhealthy_not_usage() {
     let parsed: serde_json::Value =
         serde_json::from_str(first).unwrap_or_else(|e| panic!("stderr not JSON: {first:?} ({e})"));
     assert_eq!(parsed["code"], "CONFIG");
+}
+
+/// The right shape for an Application (client) ID, with no registration behind it.
+const CLIENT_ID: &str = "12345678-abcd-4321-9876-0123456789ab";
+
+/// A fresh 0700 directory, so `doctor` reports no loose-mode finding for it.
+fn private_dir(tag: &str) -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = std::env::temp_dir().join(format!("todo-mcp-smoke-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .expect("created");
+    dir
+}
+
+/// `doctor`'s FINDING lines that name `var`.
+fn findings_naming<'a>(stdout: &'a str, var: &str) -> Vec<&'a str> {
+    stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with("FINDING") && l.contains(var))
+        .collect()
+}
+
+/// One rejected variable is one finding, and `doctor` goes on to the data
+/// directory and token store. Only the Graph check, which needs the client id,
+/// tenant, scope and data dir, is skipped for one of those, and says so. The
+/// exact count proves nothing is reported twice: each case is the issue plus the
+/// "no token.json" finding.
+#[test]
+fn doctor_reports_each_configuration_issue_and_keeps_going() {
+    let dir = private_dir("doctor-issues");
+    let doctor = |vars: &[(&str, &str)]| {
+        let out = bin()
+            .arg("doctor")
+            .env("TODO_MCP_CLIENT_ID", CLIENT_ID)
+            .env("TODO_MCP_TZ", "Europe/Prague")
+            .env("TODO_MCP_DATA_DIR", &dir)
+            .envs(vars.iter().copied())
+            .output()
+            .expect("spawned");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(out.status.code(), Some(1), "{vars:?}: {stdout}");
+        stdout
+    };
+    for (var, value, graph_needs_it) in [
+        ("TODO_MCP_TZ", "Mars/Olympus_Mons", false),
+        ("TODO_MCP_TENANT", "bad tenant/value", true),
+        ("TODO_MCP_SCOPE", "Mail.ReadWrite", true),
+        ("TODO_MCP_CLIENT_ID", "not-a-guid-SECRETVALUE", true),
+    ] {
+        let stdout = doctor(&[(var, value)]);
+        assert_eq!(findings_naming(&stdout, var).len(), 1, "{var}: {stdout}");
+        assert!(!stdout.contains(value), "{var} echoed its value: {stdout}");
+        assert!(
+            stdout.contains("\ndata directory\n  path:")
+                && stdout.contains("\ntoken store\n  FINDING  no token.json"),
+            "{var}: {stdout}"
+        );
+        assert!(stdout.contains("\n2 finding(s)."), "{var}: {stdout}");
+        assert_eq!(
+            stdout.contains(&format!("microsoft graph\n  skipped: {var} rejected above")),
+            graph_needs_it,
+            "{var}: {stdout}"
+        );
+    }
+
+    // Two issues are two findings, never one joined line.
+    let stdout = doctor(&[
+        ("TODO_MCP_TZ", "Mars/Olympus_Mons"),
+        ("TODO_MCP_TENANT", "bad tenant/value"),
+    ]);
+    let tz = findings_naming(&stdout, "TODO_MCP_TZ");
+    let tenant = findings_naming(&stdout, "TODO_MCP_TENANT");
+    assert!(
+        tz.len() == 1 && tenant.len() == 1 && tz != tenant,
+        "{stdout}"
+    );
+    assert!(stdout.contains("\n3 finding(s)."), "{stdout}");
+
+    // A relative data dir: both sections that need it are skipped, and nothing is
+    // created relative to the working directory.
+    let out = bin()
+        .arg("doctor")
+        .current_dir(&dir)
+        .env("TODO_MCP_CLIENT_ID", CLIENT_ID)
+        .env("TODO_MCP_TZ", "Europe/Prague")
+        .env("TODO_MCP_DATA_DIR", "relative-data-dir")
+        .output()
+        .expect("spawned");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(!stdout.contains("relative-data-dir"), "{stdout}");
+    for section in ["data directory", "token store"] {
+        assert!(
+            stdout.contains(&format!(
+                "\n{section}\n  skipped: TODO_MCP_DATA_DIR was rejected above\n"
+            )),
+            "{section}: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("microsoft graph\n  skipped: TODO_MCP_DATA_DIR rejected above"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\n1 finding(s)."), "{stdout}");
+    assert!(
+        !dir.join("relative-data-dir").exists(),
+        "doctor created the relative data dir"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rejected tenant means the fallback authority is not the operator's: no
+/// refresh may run against it, even with a matching token.json. A refresh that
+/// ran would add a finding (Microsoft's refusal or the transport error), so the
+/// count of exactly one, the tenant, proves it did not.
+#[test]
+fn doctor_with_a_rejected_tenant_never_refreshes_a_present_token() {
+    use microsoft_todo_mcp::auth::Secret;
+    use microsoft_todo_mcp::auth::store::{self, SaveMode, TokenFile};
+
+    let dir = private_dir("doctor-tenant-token");
+    let token = TokenFile {
+        schema_version: store::SCHEMA_VERSION,
+        account_id: "default".into(),
+        client_id: CLIENT_ID.into(),
+        authority: "https://login.microsoftonline.com/common".into(),
+        requested_scope: "https://graph.microsoft.com/Tasks.ReadWrite offline_access".into(),
+        granted_scope: "https://graph.microsoft.com/Tasks.ReadWrite offline_access".into(),
+        refresh_token: Secret::new("rt-fake"),
+        obtained_at: "2026-08-25T13:49:05.113000Z".into(),
+        obtained_by: "device_code".into(),
+        rotated_from: None,
+    };
+    store::save_atomic(&dir, &token, None, SaveMode::Login).expect("saved");
+    let out = bin()
+        .arg("doctor")
+        .env("TODO_MCP_CLIENT_ID", CLIENT_ID)
+        .env("TODO_MCP_TZ", "Europe/Prague")
+        .env("TODO_MCP_DATA_DIR", &dir)
+        .env("TODO_MCP_HTTP_TIMEOUT_MS", "1000")
+        .env("TODO_MCP_TENANT", "bad tenant/value")
+        .output()
+        .expect("spawned");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("  token.json: present"), "{stdout}");
+    assert!(
+        stdout.contains("microsoft graph\n  skipped: TODO_MCP_TENANT rejected above"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("refresh:"), "{stdout}");
+    assert!(stdout.contains("\n1 finding(s)."), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What `doctor` works around, every other subcommand still refuses: `serve`,
+/// `login`, `logout` and `token` with exit::USAGE before touching the data dir,
+/// `healthcheck` as unhealthy (Docker reserves 2). Neither echoes the value.
+#[test]
+fn the_other_commands_still_refuse_what_doctor_works_around() {
+    let closed_port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("addr").port()
+    }; // Dropped: nothing listens there now.
+    let dir = private_dir("refusals");
+    for (var, value) in [
+        ("TODO_MCP_TZ", "Mars/Olympus_Mons"),
+        ("TODO_MCP_TENANT", "bad tenant/value"),
+    ] {
+        for (cmd, code) in [
+            ("serve", 2),
+            ("login", 2),
+            ("logout", 2),
+            ("token", 2),
+            ("healthcheck", 1),
+        ] {
+            let out = bin()
+                .arg(cmd)
+                .env("TODO_MCP_CLIENT_ID", CLIENT_ID)
+                .env("TODO_MCP_DATA_DIR", &dir)
+                .env("TODO_MCP_BIND", format!("127.0.0.1:{closed_port}"))
+                .env("TODO_MCP_HTTP_TIMEOUT_MS", "1000")
+                .env(var, value)
+                .output()
+                .expect("spawned");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(code), "{cmd} {var}: {stderr}");
+            assert!(
+                out.stdout.is_empty(),
+                "{cmd} {var} wrote to stdout: {:?}",
+                out.stdout
+            );
+            let first = stderr.lines().next().unwrap_or_default();
+            let parsed: serde_json::Value = serde_json::from_str(first)
+                .unwrap_or_else(|e| panic!("{cmd} {var}: stderr not JSON: {first:?} ({e})"));
+            assert_eq!(parsed["code"], "CONFIG", "{cmd} {var}: {stderr}");
+            assert!(
+                parsed["msg"].as_str().unwrap_or_default().contains(var),
+                "{cmd} {var}: {stderr}"
+            );
+            assert!(!stderr.contains(value), "{cmd} echoed {var}: {stderr}");
+            assert!(
+                !dir.join("bearer.token").exists(),
+                "{cmd} {var} created a bearer"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Waits for `child` to connect, failing fast (instead of hanging the suite) if
