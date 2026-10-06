@@ -20,6 +20,7 @@ docs
 **/token.json
 **/token.json.tmp.*
 **/bearer.token
+**/bearer.token.tmp.*
 **/.token.lock
 .todo-mcp
 data

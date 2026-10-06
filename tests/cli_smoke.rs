@@ -234,6 +234,30 @@ fn doctor_reports_each_configuration_issue_and_keeps_going() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `token` and `serve` refuse a dangling symlink at the bearer path, so `doctor`
+/// must not promise to generate a bearer there.
+#[test]
+fn doctor_reports_a_dangling_bearer_symlink() {
+    let dir = private_dir("doctor-dangling-bearer");
+    std::os::unix::fs::symlink(dir.join("missing"), dir.join("bearer.token")).expect("symlink");
+    let out = bin()
+        .arg("doctor")
+        .env("TODO_MCP_CLIENT_ID", CLIENT_ID)
+        .env("TODO_MCP_TZ", "Europe/Prague")
+        .env("TODO_MCP_DATA_DIR", &dir)
+        .output()
+        .expect("spawned");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("  bearer: dangling symlink\n"), "{stdout}");
+    assert_eq!(
+        findings_naming(&stdout, "is a dangling symlink").len(),
+        1,
+        "{stdout}"
+    );
+    assert!(!stdout.contains("generated on first"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A rejected tenant means the fallback authority is not the operator's: no
 /// refresh may run against it, even with a matching token.json. A refresh that
 /// ran would add a finding (Microsoft's refusal or the transport error), so the

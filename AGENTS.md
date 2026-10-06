@@ -73,6 +73,26 @@ leaves, importing no crate module: clock, errors, logger, mcp, sem
 - **Two credentials, never conflated.** The inbound MCP bearer guards `/mcp`; a
   separate expiring OAuth token guards outbound Graph. The bearer is never
   forwarded to Graph and a Graph token is never accepted as MCP auth.
+- **Exactly one process generates `bearer.token`** (`cli/commands.rs::settle_bearer`,
+  #14). `serve` and `token` can get there at the same moment, and `serve` enforces
+  the value it returned. An absent file is written and synced to a
+  `bearer.token.tmp.*` beside it, then `hard_link`ed into place; `AlreadyExists`
+  makes the loser re-read and adopt. An empty or blank file is filled **in place**
+  under an exclusive flock on it, after checking the path still names the locked
+  file, then re-reading it: a rename would replace a single-file bind mount (EBUSY)
+  or a symlink, and needs a writable directory. Its fd is read+write, which an
+  exclusive flock needs on NFS. **Every read takes the shared flock**
+  (`read_bearer`): `read_to_string` reads more than once, and an unlocked read of a
+  `"\n"` file can glue it to the tail of the bearer being written and adopt a
+  63-character one. `read_bearer` closes its fd before the caller can take the
+  exclusive lock on another; a process holding both would wait on itself. Each
+  step has its own test in `cli/commands.rs` that fails without it, on one CPU too:
+  `hard_link`, the fill in place, the exclusive lock, the inode check, the locked
+  re-read and the shared read. The 8-thread stress tests need two CPUs to catch a
+  lost race. flock excludes only processes on one kernel: on NFS `nolock` or a FUSE
+  mount without flock, two hosts could both fill a blank file (the hard-link create
+  stays exclusive). `doctor` flags a dangling or non-regular bearer path, which
+  `token` and `serve` refuse.
 - **The `Authorization` header is named in exactly two files.** `graph/client.rs`
   sets the outbound one and `http.rs` reads the inbound one; gate 3 allows nothing
   else, so do not name it in a `src/` test either.
@@ -205,8 +225,8 @@ hand-rolls a fixture Entra/Graph server on `tiny_http` (already a dependency), s
    filter typo: the log-hygiene parents assert the child's stdout says `1 passed`, and
    the shutdown tests wait for the child's own log lines before signalling it.
 
-**234 tests per run: 121 unit** (in the lib; `main.rs` has none) **and 113
-integration** — cli_smoke 13, graph_client 12, http_auth 2, shutdown 8 (one is the
+**244 tests per run: 129 unit** (in the lib; `main.rs` has none) **and 115
+integration** — cli_smoke 14, graph_client 12, http_auth 2, shutdown 9 (one is the
 `child_process_entry` body, a no-op outside the child), token_store 19, tools_read 35,
 tools_write 24 — and 0 doctests. The count is the same under the host zone, under
 `TZ=Pacific/Kiritimati` and inside `docker build --target test .`.
@@ -349,7 +369,7 @@ and can print a task title.
 ## Status and where to start
 
 **Implemented and tested offline.** `auth/`, `graph/`, `domain/`, `cache.rs`,
-`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 234
+`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 244
 tests (see Tests) pass under the host zone, under `TZ=Pacific/Kiritimati` and inside
 `docker build --target test .`, with clippy `-D warnings`, `cargo fmt --check` and
 the ten gates green.
@@ -460,9 +480,9 @@ them):
   block for `TODO_MCP_HTTP_TIMEOUT_MS` plus a `.token.lock` wait. After that the first
   signal drains for up to 5 s and the second exits 0 immediately. A handler that
   cannot be installed is a startup refusal (exit 1, code `TRANSPORT`), never ignored.
-  Only the refresh window of boot is regression-tested (`tests/shutdown.rs` parks the
-  real binary on `.token.lock`); nothing proves `Shutdown` precedes config, the `/data`
-  probe or the bearer.
+  The bearer step and the refresh window of boot are regression-tested
+  (`tests/shutdown.rs` parks the real binary on a flock on `bearer.token`, then on
+  `.token.lock`); nothing proves `Shutdown` precedes config or the `/data` probe.
 - **Every requested stop exits 0**, matching README's Exit codes row 0: a signal during
   startup or a second signal exits without a `stopped` log line; requests still running
   when the 5 s drain ends are abandoned and logged as warn

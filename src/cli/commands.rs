@@ -1,7 +1,7 @@
 //! The subcommands. Each returns an exit code; human output goes through
 //! `out`, operational output through `logger`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -33,47 +33,256 @@ fn env(k: &str) -> Option<String> {
 
 const TZ_WARNING: &str = "TODO_MCP_TZ is unset; using UTC. Microsoft To Do anchors due dates to your mailbox's time zone — with the wrong zone, \"due today\" is off by one day for part of every day. Set TODO_MCP_TZ to the IANA zone shown in Outlook → Settings → Language and time.";
 
+/// How often the bearer path is re-read when it changed between the read and the
+/// write. Losing to another creator, or finding an empty file replaced while
+/// waiting for its lock, costs one attempt each.
+const BEARER_ATTEMPTS: usize = 4;
+
 /// Read the inbound MCP bearer, generating a 256-bit one on first use.
 pub fn load_or_create_bearer(path: &Path) -> Result<String, AppError> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    match std::fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => return Ok(s.trim().to_string()),
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(AppError::Config(format!(
-                "bearer file {} is unreadable ({})",
-                path.display(),
-                e.kind()
-            )));
+    match settle_bearer(path)? {
+        Bearer::Found(token) => Ok(token),
+        Bearer::Generated(token) => {
+            logger::info(
+                "generated a new MCP bearer token",
+                &[("path", json!(path.display().to_string()))],
+            );
+            Ok(token)
         }
     }
-    let mut bytes = [0u8; 32];
+}
+
+/// What [`settle_bearer`] found at the bearer path, or put there.
+#[derive(Debug, PartialEq, Eq)]
+enum Bearer {
+    Found(String),
+    Generated(String),
+}
+
+/// The bearer at `path`, generating one if there is none. Logs nothing:
+/// `load_or_create_bearer` does, and the tests that race this stay quiet.
+///
+/// `serve` and `token` can both get here at once on an empty volume, and each must
+/// end up with the value the other sees, because `serve` enforces the one it
+/// returns (#14). So exactly one caller generates:
+/// - an absent file is created by writing and syncing a temp file beside it and
+///   `hard_link`ing that into place, which fails if the path exists by then. The
+///   loser re-reads and adopts the winner's file, and no reader can find it
+///   half-written;
+/// - an empty or blank file (an interrupted write, or one an operator made) is
+///   filled in place under an exclusive flock on it, keeping its inode, owner and
+///   mode, so a bind-mounted file or a symlink's target is filled rather than
+///   replaced. Every read takes the shared flock, so it sees the file blank before
+///   a fill or whole after it.
+fn settle_bearer(path: &Path) -> Result<Bearer, AppError> {
+    for _ in 0..BEARER_ATTEMPTS {
+        let settled = match read_bearer(path) {
+            Ok(s) if !s.trim().is_empty() => return Ok(Bearer::Found(s.trim().to_string())),
+            Ok(_) => fill_blank_bearer(path)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_bearer(path)?,
+            Err(e) => return Err(bearer_unreadable(path, &e)),
+        };
+        if let Some(bearer) = settled {
+            return Ok(bearer);
+        }
+    }
+    Err(AppError::Config(format!(
+        "cannot create bearer file {} (the path kept changing while it was created; a dangling symlink there never resolves)",
+        path.display()
+    )))
+}
+
+/// Read the bearer under a shared flock. A fill holds the exclusive one from its
+/// truncate through its write, sync and any rollback, and `read_to_string` reads
+/// more than once: unlocked, it could stitch a blank file's bytes onto the tail of
+/// the bearer being written, or adopt one that is about to be rolled back. The fd
+/// and its lock close on return, before the caller may take the exclusive lock on
+/// another fd, which would otherwise wait for this one forever.
+///
+/// flock excludes only processes that share a kernel's locks. Where a filesystem
+/// keeps them local to each client (NFS mounted `nolock` or `local_lock=flock`,
+/// FUSE without flock support), callers on two hosts could both fill a blank file;
+/// the hard-link create stays exclusive there, because the server refuses the
+/// second link.
+fn read_bearer(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut f = std::fs::File::open(path)?;
+    // Where flock fails, the fill's exclusive lock fails too, so no fill can run
+    // under this read; a bearer already there is still served.
+    let _ = f.lock_shared();
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(s)
+}
+
+/// The path is absent: publish a new bearer only if it still is. `None` means
+/// another creator won, and the caller re-reads its file.
+fn create_bearer(path: &Path) -> Result<Option<Bearer>, AppError> {
+    let draft = BearerDraft::write(path)?;
+    match std::fs::hard_link(&draft.tmp, path) {
+        Ok(()) => {
+            let token = draft.token.clone();
+            // Unlink the temp name now: a signal exit before the end of this
+            // function would leave it behind as a second name for the bearer.
+            drop(draft);
+            sync_parent(path);
+            Ok(Some(Bearer::Generated(token)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        // EPERM on Linux, ENOTSUP on macOS where the filesystem has no hard links.
+        Err(e) => Err(AppError::Config(format!(
+            "cannot create bearer file {}: linking it into place failed ({}); its directory must support hard links (FAT, exFAT and some SMB shares do not), or write a bearer into the file yourself",
+            path.display(),
+            e.kind()
+        ))),
+    }
+}
+
+/// The path holds an empty or blank file. Exactly one process fills it: each takes
+/// an exclusive flock on the file, and once it holds the lock, checks that the path
+/// still names that file and that the file is still blank. A process that waited
+/// finds it filled and adopts the value, or finds it replaced and returns `None`
+/// for the caller to re-read.
+fn fill_blank_bearer(path: &Path) -> Result<Option<Bearer>, AppError> {
+    // Writable because the fill writes through it, which is also what an exclusive
+    // flock needs on NFS, where it is emulated with a POSIX lock.
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(blank) => fill_opened_bearer(path, blank),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(bearer_unwritable(path, &e)),
+    }
+}
+
+/// [`fill_blank_bearer`] from the lock on: `blank` is the file as it was opened,
+/// whatever `path` names by the time the lock is held.
+fn fill_opened_bearer(path: &Path, mut blank: std::fs::File) -> Result<Option<Bearer>, AppError> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{FileExt, MetadataExt};
+
+    blank.lock().map_err(|e| bearer_unwritable(path, &e))?;
+    let held = blank.metadata().map_err(|e| bearer_unreadable(path, &e))?;
+    match std::fs::metadata(path) {
+        Ok(now) if (now.dev(), now.ino()) == (held.dev(), held.ino()) => {}
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(bearer_unreadable(path, &e)),
+    }
+    // A device node reads empty too, and has nowhere to keep a bearer.
+    if !held.file_type().is_file() {
+        return Err(AppError::Config(format!(
+            "bearer file {} is empty and not a regular file",
+            path.display()
+        )));
+    }
+    let mut s = String::new();
+    blank
+        .read_to_string(&mut s)
+        .map_err(|e| bearer_unreadable(path, &e))?;
+    if !s.trim().is_empty() {
+        return Ok(Some(Bearer::Found(s.trim().to_string())));
+    }
+    let token = random_hex(32)?;
+    let filled = blank
+        .set_len(0)
+        .and_then(|()| blank.write_all_at(token.as_bytes(), 0))
+        .and_then(|()| blank.sync_all());
+    if let Err(e) = filled {
+        // Blank again, never a partial bearer. No reader saw the written one: reads
+        // wait for this lock.
+        let _ = blank.set_len(0);
+        return Err(bearer_unwritable(path, &e));
+    }
+    // `blank` closes on return, which releases the lock for any process waiting.
+    Ok(Some(Bearer::Generated(token)))
+}
+
+/// A new bearer in a temp file beside the bearer path, already written, synced
+/// and mode 0600 before anything can publish it. Dropping it removes the temp
+/// name, so no return, error or panic leaves one behind.
+struct BearerDraft {
+    token: String,
+    tmp: PathBuf,
+}
+
+impl BearerDraft {
+    fn write(path: &Path) -> Result<Self, AppError> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let token = random_hex(32)?;
+        // Beside the bearer, so `hard_link` stays on one filesystem. The random
+        // suffix keeps concurrent drafts apart, even two threads of one process in
+        // the same nanosecond.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".tmp.{}.{}", std::process::id(), random_hex(8)?));
+        let tmp = PathBuf::from(tmp);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| bearer_uncreatable(path, &e))?;
+        let draft = Self { token, tmp };
+        f.write_all(draft.token.as_bytes())
+            .and_then(|()| f.sync_all())
+            .map_err(|e| bearer_uncreatable(path, &e))?;
+        Ok(draft)
+    }
+}
+
+impl Drop for BearerDraft {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.tmp);
+    }
+}
+
+/// `n` bytes from the system CSPRNG, hex-encoded.
+fn random_hex(n: usize) -> Result<String, AppError> {
+    let mut bytes = vec![0u8; n];
     getrandom::fill(&mut bytes)
         .map_err(|_| AppError::Config("the system CSPRNG is unavailable".into()))?;
-    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| {
-            AppError::Config(format!(
-                "cannot create bearer file {} ({})",
-                path.display(),
-                e.kind()
-            ))
-        })?;
-    f.write_all(token.as_bytes())
-        .map_err(|e| AppError::Config(format!("cannot write bearer file ({})", e.kind())))?;
-    logger::info(
-        "generated a new MCP bearer token",
-        &[("path", json!(path.display().to_string()))],
-    );
-    Ok(token)
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// fsync the bearer's directory, which makes the new name durable, the way
+/// `store::save_atomic` does for token.json.
+fn sync_parent(path: &Path) {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+fn bearer_unreadable(path: &Path, e: &std::io::Error) -> AppError {
+    AppError::Config(format!(
+        "bearer file {} is unreadable ({})",
+        path.display(),
+        e.kind()
+    ))
+}
+
+fn bearer_uncreatable(path: &Path, e: &std::io::Error) -> AppError {
+    AppError::Config(format!(
+        "cannot create bearer file {} ({})",
+        path.display(),
+        e.kind()
+    ))
+}
+
+fn bearer_unwritable(path: &Path, e: &std::io::Error) -> AppError {
+    AppError::Config(format!(
+        "cannot write bearer file {} ({})",
+        path.display(),
+        e.kind()
+    ))
 }
 
 /// One-shot commands have nothing to shut down gracefully, so SIGINT/SIGTERM end
@@ -100,9 +309,9 @@ pub fn exit_on_interrupt() {
 /// signal starts the drain in `http::run_http` and the second exits 0 without
 /// waiting for it.
 ///
-/// `tests/shutdown.rs` regression-tests the boot phase only inside the refresh
-/// (the one boot step that can be parked hermetically), not that this runs
-/// ahead of config, the `/data` probe and the bearer.
+/// `tests/shutdown.rs` regression-tests the boot phase inside the bearer step and
+/// the refresh (the boot steps that can be parked hermetically, on a flock), not
+/// that this runs ahead of config and the `/data` probe.
 pub struct Shutdown {
     booting: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
@@ -686,7 +895,24 @@ pub fn doctor(verbose: bool) -> Result<i32, AppError> {
             Err(e) => finding(&e.message()),
         }
         let bearer_state = match std::fs::metadata(&cfg.bearer_file) {
-            Ok(_) => "present".to_string(),
+            Ok(m) if m.file_type().is_file() => "present".to_string(),
+            Ok(_) => {
+                finding(&format!(
+                    "the bearer file {} is not a regular file, so `token` and `serve` cannot keep a bearer in it. Fix: point TODO_MCP_BEARER_FILE at a regular file",
+                    cfg.bearer_file.display()
+                ));
+                "not a regular file".to_string()
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(&cfg.bearer_file).is_ok() =>
+            {
+                finding(&format!(
+                    "the bearer file {} is a dangling symlink, which `token` and `serve` refuse. Fix: remove it, or create its target holding a bearer",
+                    cfg.bearer_file.display()
+                ));
+                "dangling symlink".to_string()
+            }
             Err(_) => "absent (generated on first `token` or `serve`)".to_string(),
         };
         out::line(&format!("  bearer: {bearer_state}"));
@@ -1001,5 +1227,304 @@ mod tests {
         assert!(!shutdown.booting.load(Ordering::SeqCst));
         assert!(Arc::ptr_eq(&stopping, &shutdown.stopping));
         assert!(!stopping.load(Ordering::SeqCst));
+    }
+
+    /// Racers per round. More than `serve` + `token` ever are, so a lost race shows
+    /// up within a few rounds on a machine with two or more CPUs. On one CPU a racer
+    /// often finishes inside its timeslice, which is why the tests after the two
+    /// stress tests pin each step of the protocol on its own.
+    const BEARER_RACERS: usize = 8;
+    const BEARER_ROUNDS: usize = 20;
+
+    fn bearer_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("todo-mcp-bearer-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn is_bearer(s: &str) -> bool {
+        s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// `settle_bearer` from `BEARER_RACERS` threads, all released by `barrier`
+    /// (which may count other parties too). Joined without unwrapping, so a racer's
+    /// panic reaches the caller as a value.
+    fn race_for_bearer(
+        path: &Path,
+        barrier: &Arc<std::sync::Barrier>,
+    ) -> Vec<std::thread::Result<Result<Bearer, String>>> {
+        let handles: Vec<_> = (0..BEARER_RACERS)
+            .map(|_| {
+                let (path, barrier) = (path.to_path_buf(), Arc::clone(barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    settle_bearer(&path).map_err(|e| e.message())
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join()).collect()
+    }
+
+    /// Exactly one racer generated, every racer returned that bearer, and it is
+    /// exactly what the file holds: 64 hex characters, no newline, mode `mode`, and
+    /// no temp file beside it.
+    fn assert_one_bearer(
+        round: usize,
+        path: &Path,
+        joined: Vec<std::thread::Result<Result<Bearer, String>>>,
+        mode: u32,
+    ) {
+        let results: Vec<Bearer> = joined
+            .into_iter()
+            .map(|r| match r {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => panic!("round {round}: a racer failed: {e}"),
+                Err(_) => panic!("round {round}: a racer panicked"),
+            })
+            .collect();
+        let generated = results
+            .iter()
+            .filter(|b| matches!(b, Bearer::Generated(_)))
+            .count();
+        assert_eq!(
+            generated, 1,
+            "round {round}: {generated} racers generated: {results:?}"
+        );
+        let tokens: Vec<&String> = results
+            .iter()
+            .map(|b| match b {
+                Bearer::Found(t) | Bearer::Generated(t) => t,
+            })
+            .collect();
+        let first = tokens[0];
+        assert!(
+            tokens.iter().all(|t| *t == first),
+            "round {round}: racers disagree: {results:?}"
+        );
+        assert!(is_bearer(first), "round {round}: {first:?}");
+        let on_disk = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            &on_disk, first,
+            "round {round}: file differs from the racers"
+        );
+        let got = mode_of(path);
+        assert_eq!(got, mode, "round {round}: mode {got:o}, expected {mode:o}");
+        assert_eq!(
+            entries(path.parent().unwrap()),
+            ["bearer.token"],
+            "round {round}: something was left beside the bearer"
+        );
+    }
+
+    #[test]
+    fn concurrent_bearer_creators_agree_and_publish_only_whole_files() {
+        let dir = bearer_dir("race");
+        for round in 0..BEARER_ROUNDS {
+            let parent = dir.join(format!("round-{round}"));
+            std::fs::create_dir(&parent).unwrap();
+            let path = parent.join("bearer.token");
+            let barrier = Arc::new(std::sync::Barrier::new(BEARER_RACERS + 1));
+            let done = Arc::new(AtomicBool::new(false));
+            // Reads without any lock, which is stricter than `read_bearer`: a
+            // hard-linked file must look whole even to an operator's `cat`. It must
+            // only ever see no file or a whole bearer: never an empty or partial one.
+            let reader = {
+                let (path, barrier, done) = (path.clone(), Arc::clone(&barrier), done.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    while !done.load(Ordering::SeqCst) {
+                        match std::fs::read_to_string(&path) {
+                            Ok(s) if is_bearer(&s) => {}
+                            Ok(s) => return Some(format!("read {s:?}")),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Some(format!("read failed: {e}")),
+                        }
+                    }
+                    None
+                })
+            };
+            let joined = race_for_bearer(&path, &barrier);
+            // Stop the reader before judging anything, a racer's panic included.
+            done.store(true, Ordering::SeqCst);
+            let torn = reader.join().unwrap();
+            assert_eq!(torn, None, "round {round}: a reader saw an unfinished file");
+            assert_one_bearer(round, &path, joined, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_bearer_file_is_filled_once_in_place_under_concurrency() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = bearer_dir("fill");
+        for round in 0..BEARER_ROUNDS {
+            let parent = dir.join(format!("round-{round}"));
+            std::fs::create_dir(&parent).unwrap();
+            let path = parent.join("bearer.token");
+            // What an interrupted write leaves behind, or a blank file an operator
+            // made, with a mode of their choosing that the fill must keep.
+            std::fs::write(&path, if round % 2 == 0 { "" } else { "  \n" }).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let ino = std::fs::metadata(&path).unwrap().ino();
+            let barrier = Arc::new(std::sync::Barrier::new(BEARER_RACERS));
+            let joined = race_for_bearer(&path, &barrier);
+            assert_one_bearer(round, &path, joined, 0o640);
+            let now = std::fs::metadata(&path).unwrap().ino();
+            assert_eq!(now, ino, "round {round}: the file was replaced, not filled");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_bearer_never_replaces_a_file_that_appeared() {
+        let dir = bearer_dir("exists");
+        let path = dir.join("bearer.token");
+        // Another creator's bearer, landed between this one's read and its publish.
+        let winner = "a".repeat(64);
+        std::fs::write(&path, &winner).unwrap();
+        let got = create_bearer(&path).map_err(|e| e.message());
+        assert!(matches!(got, Ok(None)), "{got:?}");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, winner, "the winner's file was overwritten");
+        assert_eq!(
+            entries(&dir),
+            ["bearer.token"],
+            "a temp file was left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_blank_bearer_replaced_before_its_lock_is_held_is_re_read() {
+        let dir = bearer_dir("swapped");
+        let path = dir.join("bearer.token");
+        std::fs::write(&path, "").unwrap();
+        // What a waiter holds: the blank file, opened before another process
+        // replaced it, and locked only afterwards.
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let fresh = "b".repeat(64);
+        let sibling = dir.join("fresh");
+        std::fs::write(&sibling, &fresh).unwrap();
+        std::fs::rename(&sibling, &path).unwrap();
+        // Filling the file it opened would return a bearer the path no longer holds.
+        let got = fill_opened_bearer(&path, opened).map_err(|e| e.message());
+        assert!(matches!(got, Ok(None)), "{got:?}");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, fresh, "the replacement was overwritten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Holds the exclusive lock on a blank file the way a fill in progress does,
+    /// starts `run` on another thread, and checks that it is still waiting after a
+    /// while. Correct code waits for as long as the lock is held, so that check can
+    /// never fail; on a slow machine a regression may slip past it, never the reverse.
+    /// The holder then writes `fresh` into the file and lets go, and `run` returns.
+    fn while_a_fill_holds_the_lock<T: Send + 'static>(
+        tag: &str,
+        run: impl FnOnce(std::path::PathBuf) -> T + Send + 'static,
+    ) -> (T, String) {
+        use std::os::unix::fs::FileExt;
+        let dir = bearer_dir(tag);
+        let path = dir.join("bearer.token");
+        std::fs::write(&path, "  \n").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        holder.lock().unwrap();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || run(path))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "{tag}: it did not wait for the lock");
+        let fresh = "c".repeat(64);
+        holder.set_len(0).unwrap();
+        holder.write_all_at(fresh.as_bytes(), 0).unwrap();
+        drop(holder);
+        let got = waiter.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (got, fresh)
+    }
+
+    #[test]
+    fn a_bearer_fill_waits_for_the_lock_and_adopts_what_its_holder_wrote() {
+        let (got, fresh) = while_a_fill_holds_the_lock("fill-waits", |path| {
+            fill_blank_bearer(&path).map_err(|e| e.message())
+        });
+        assert_eq!(got, Ok(Some(Bearer::Found(fresh))));
+    }
+
+    #[test]
+    fn a_bearer_read_waits_out_a_fill_in_progress() {
+        let (got, fresh) = while_a_fill_holds_the_lock("read-waits", |path| {
+            read_bearer(&path).map_err(|e| e.to_string())
+        });
+        assert_eq!(got, Ok(fresh));
+    }
+
+    #[test]
+    fn an_empty_bearer_behind_a_symlink_is_filled_through_it() {
+        let dir = bearer_dir("symlink");
+        let target = dir.join("provisioned");
+        std::fs::write(&target, "").unwrap();
+        let path = dir.join("bearer.token");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let got = settle_bearer(&path).map_err(|e| e.message());
+        let Ok(Bearer::Generated(token)) = &got else {
+            panic!("an empty symlink target must be filled: {got:?}");
+        };
+        let on_disk = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(&on_disk, token, "the target does not hold the bearer");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink was replaced"
+        );
+        assert_eq!(entries(&dir), ["bearer.token", "provisioned"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bearer_path_that_cannot_be_created_leaves_no_temp_file() {
+        let dir = bearer_dir("dangling");
+        let path = dir.join("bearer.token");
+        std::os::unix::fs::symlink(dir.join("missing").join("target"), &path).unwrap();
+        let Err(e) = settle_bearer(&path) else {
+            panic!("a bearer path that resolves nowhere must be refused");
+        };
+        assert_eq!(e.code(), "CONFIG", "{}", e.message());
+        assert_eq!(entries(&dir), ["bearer.token"], "{}", e.message());
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be left alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

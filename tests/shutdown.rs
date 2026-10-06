@@ -6,17 +6,17 @@
 //! has no fixture seam. So two kinds of subprocess, both started with
 //! `env_clear()`:
 //!
-//! - the real binary, parked inside the boot refresh by this test's own flock
-//!   on `.token.lock`, which proves the handlers exist during the refresh;
+//! - the real binary, parked in the bearer step by this test's own flock on
+//!   `bearer.token`, or inside the boot refresh by its flock on `.token.lock`,
+//!   which proves the handlers exist during both;
 //! - this test binary re-executed as `child_process_entry`, running the same
 //!   `Shutdown` + `run_http` that `serve` runs with a stub tool, which proves the
 //!   drain, an in-flight response, the drain-deadline warning and the
 //!   second-signal exit.
 //!
-//! Only the refresh window of boot is regression-tested. Nothing in config, the
-//! `/data` probe or bearer generation blocks hermetically, so a regression that
-//! moved `Shutdown::install()` below them but still above `access_token()` would
-//! pass here.
+//! Only those two boot steps are regression-tested. Nothing in config or the
+//! `/data` probe blocks hermetically, so a regression that moved
+//! `Shutdown::install()` below them but still above the bearer would pass here.
 //!
 //! No token.json is ever written in the offline cases, so nothing there can
 //! reach the network even if a synchronisation assumption breaks: the default
@@ -337,6 +337,41 @@ fn a_signal_during_the_boot_refresh_exits_zero_at_once() {
         assert!(!dir.join("token.json").exists());
 
         drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn a_signal_while_parked_on_the_bearer_lock_exits_zero_at_once() {
+    for sig in ["TERM", "INT"] {
+        let dir = data_dir(&format!("shutdown-bearer-{sig}"));
+        // Hold the exclusive flock a bearer fill holds: `serve` gets past config
+        // and the /data probe, then waits in `read_bearer` for the shared one.
+        // Released, it would reach the boot refresh and exit 3 (no token.json).
+        let path = dir.join("bearer.token");
+        std::fs::write(&path, "0".repeat(64)).expect("bearer");
+        let held = std::fs::File::open(&path).expect("bearer fd");
+        held.lock().expect("flock");
+
+        let mut p = Proc::spawn(serve_cmd(&dir));
+        // Not a log line to wait for: nothing is logged before the bearer step. A
+        // handler installed after it is missing for every signal sent while the
+        // lock is held, so this sleep only has to let `serve` start.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(p.running(), "serve should be parked on bearer.token");
+
+        p.signal(sig);
+        let status = p.exit_within(Duration::from_secs(2));
+        // Without a handler during boot the child dies by the signal (code None).
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "SIG{sig} in the bearer step: {status:?}"
+        );
+        let log = p.log();
+        assert!(!has(&log, "microsoft-todo-mcp started"), "{log:#?}");
+
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

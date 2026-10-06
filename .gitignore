@@ -4,7 +4,7 @@
 !.env.example
 .envrc
 
-# Credentials. token.json, its temp files, .token.lock and bearer.token appear
+# Credentials. token.json, bearer.token, their temp files and .token.lock appear
 # wherever TODO_MCP_DATA_DIR points, which may be inside this checkout. Never
 # redirect `token` output into a file here; if you do, these names are ignored.
 .bearer
@@ -13,6 +13,7 @@
 token.json
 token.json.tmp.*
 bearer.token
+bearer.token.tmp.*
 .token.lock
 .todo-mcp/
 /data/
