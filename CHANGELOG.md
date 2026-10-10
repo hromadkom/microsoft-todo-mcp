@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remediation in that line already says so. A runtime refresh still logs it. `login` and `doctor` still print the full text to stdout, and a
   refused tool call still returns it to the MCP client. SECURITY.md records the
   decision in place of the former "Known gaps" bullet. (#8)
+- **Every third-party GitHub Action is pinned to a full commit SHA**, with its release
+  in a trailing comment, instead of a movable tag such as `@v7`. The `publish` job holds
+  the Docker Hub token and `Hermetic gate` decides what merges, so a repointed tag was a
+  path to both. The pinned commits are the ones the tags named, so nothing else changes.
+  (#10)
 
 ### Fixed
 
