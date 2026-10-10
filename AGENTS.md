@@ -297,6 +297,11 @@ explicitly; add a directory entry alongside any new composite action. It cannot 
 the `dev` service's `dockerfile_inline` `rust:<version>-slim` pin — keep that in sync
 with `rust-toolchain.toml` by hand.
 
+Every third-party `uses:` is pinned to a full commit SHA with its release in a trailing
+comment (`@<sha> # vX.Y.Z`, #10), the SHA taken from the action's own repository
+(`gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`). Dependabot bumps both. Local
+`./.github/actions/…` references are not pinned: they resolve from the checked-out tree.
+
 The `Protected main` ruleset (a pull request with zero approvals, strict required
 checks `Hermetic gate` and `Release image`, no deletion or force-push, an always-bypass
 for admins) is created **after** the first release, so the amend and force-push path
