@@ -1,7 +1,7 @@
 //! The only module allowed to write to stdout.
 //!
 //! `login`, `doctor` and `token` are read by humans and by shell substitution
-//! (`$(docker compose run --rm -T todo-mcp token)`). Keeping every stdout write
+//! (`$(docker compose run --rm -T todo-mcp-cli token)`). Keeping every stdout write
 //! behind this module is what lets `clippy.toml` ban `println!` everywhere else,
 //! so an operational message can never contaminate a captured token.
 
