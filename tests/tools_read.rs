@@ -823,7 +823,7 @@ fn account_status_makes_no_me_call_and_reports_the_grant() {
     let login = r["login_command"].as_str().unwrap_or_default();
     assert!(login.contains("`todo-mcp login`"), "{r}");
     assert!(
-        login.contains("`docker compose run --rm todo-mcp login`"),
+        login.contains("`docker compose run --rm todo-mcp-cli login`"),
         "{r}"
     );
     assert_eq!(r["write_tools_enabled"], true);

@@ -224,6 +224,18 @@ jobs:
       - name: "Smoke: compose.yaml is valid"
         run: docker compose config -q
 
+      # login, doctor and token print a device code, list names and the bearer;
+      # todo-mcp-cli must keep none of it (SECURITY.md) and share the server's volume.
+      - name: "Smoke: one-shot service keeps no logs"
+        run: |
+          docker compose --profile cli config --format json | jq -e '
+            .services["todo-mcp-cli"] as $c | .services["todo-mcp"] as $s
+            | $c.logging == {"driver": "none"}
+              and $c.volumes == $s.volumes
+              and $c.image == $s.image
+              and $c.profiles == ["cli"]
+              and ($s.logging.driver == "json-file")'
+
       # Container first: the stopped FIFO container still references the
       # volume, so removing the volume first would fail this always() step.
       - name: Remove the smoke container and volume

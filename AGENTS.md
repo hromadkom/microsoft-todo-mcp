@@ -151,6 +151,19 @@ leaves, importing no crate module: clock, errors, logger, mcp, sem
   `child_sync_with_a_failing_sub_request`). `doctor` printing list names and (with
   `TODO_MCP_TZ` set) a task title to stdout is by design, which is why every doc tells
   users to redact it.
+- **One-shot commands run in `todo-mcp-cli`, never `todo-mcp`** (#9). It is a
+  `cli`-profile service in `compose.yaml` that `extends: todo-mcp` with
+  `logging: !override {driver: none}`, `ports: !reset []`, no restart and no
+  healthcheck: `login` prints a device code, `token` the bearer and `doctor` list names
+  and a task title, and `todo-mcp`'s `json-file` driver would keep them on the host.
+  `docker compose run` has no `--log-driver` flag, hence a service. Every documented
+  `compose run` of `login`/`doctor`/`token`/`logout`, and `LOGIN_HINT`, names
+  `todo-mcp-cli`; `up`/`restart`/`logs` name `todo-mcp`. SECURITY.md's "One-shot
+  commands run without a log driver" records the decision; `doctor`'s output is
+  deliberately not narrowed. The `Release image` job asserts the driver and the shared
+  volume. Observed on macOS arm64 Docker Desktop (2026-10-10, isolated `-p` project):
+  both services print the same bearer, `.env` reaches `doctor` and `login`, and a
+  non-`--rm` run has LogConfig `none` (`docker logs` refuses) against `json-file`.
 - **Sign-in and restart advice comes from `errors::LOGIN_HINT` and
   `errors::RESTART_HINT`.** Both name the host form (`todo-mcp login`) and the compose
   form. They are used by `AppError::NotLoggedIn`, the `TOKEN_STORE` texts
@@ -269,7 +282,8 @@ are the required-check names, exactly:
   `AUTH_REQUIRED`; with a FIFO `token.json` parking `serve` in the boot refresh,
   `docker exec -u 0 … sh` fails and `docker stop` exits 0 in under 2 s; `healthcheck`
   with nothing listening exits 1 with empty stderr (a refused configuration also exits
-  1, but logs an error line); `docker compose config -q` passes.
+  1, but logs an error line); `docker compose config -q` passes, and `todo-mcp-cli`
+  has log driver `none` and the server's volume and image.
 
 Both jobs time out at 90 minutes. The FIFO step waits for the log text
 `TODO_MCP_TZ is unset` (`TZ_WARNING` in `cli/commands.rs`), which `serve` logs before
@@ -468,7 +482,7 @@ them):
   real `https://graph.microsoft.com` URLs.
 - The inbound MCP bearer is a generated file (`<data dir>/bearer.token`), not an env
   var; `token` prints it and `serve` generates it if absent.
-- `login` under compose: `docker compose run --rm todo-mcp login` is the documented
+- `login` under compose: `docker compose run --rm todo-mcp-cli login` is the documented
   form (it uses the compose-prefixed volume and `.env`), and it needs no TTY. Every
   runtime hint names both that and plain `todo-mcp login` through `LOGIN_HINT` /
   `RESTART_HINT`, because the README also documents a host toolchain.
