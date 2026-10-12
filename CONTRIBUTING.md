@@ -136,6 +136,9 @@ convention; read it before a non-trivial change. The load-bearing ones:
   line: `serve` boots through `TokenProvider::boot_token`, which does not log a
   dead-token deletion separately because that line's remediation already says
   `token.json was deleted`. `access_token` keeps the warning for runtime refreshes.
+  A panic logs its message only when it is a string literal; a formatted one,
+  `expect` included, is logged by length. Put context in the literal, and never
+  format user content into a panic.
 - **No host time zone.** Wall-clock reads go through the injected `Clock`.
   `domain/datetime.rs` is the only caller of `from_local_datetime`.
 - **No panics across the tool boundary.** A domain error is an `{ "isError": true }` tool

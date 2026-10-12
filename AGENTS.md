@@ -151,6 +151,14 @@ leaves, importing no crate module: clock, errors, logger, mcp, sem
   `child_sync_with_a_failing_sub_request`). `doctor` printing list names and (with
   `TODO_MCP_TZ` set) a task title to stdout is by design, which is why every doc tells
   users to redact it.
+  The panic hook (`logger::install_panic_hook`, #7) logs a payload's text only when it
+  is a `&'static str`; a `String` payload is logged as `payload_bytes` beside
+  `location`. That includes every `expect` and `Result::unwrap`: std formats their
+  message, so their payload is a `String` (pinned by
+  `logger::tests::expect_messages_are_logged_by_length_only`). Put context in a literal
+  and never format user content into a panic. The test is the re-exec pair in
+  `tests/http_auth.rs` (`a_formatted_panic_message_never_reaches_stderr` /
+  `child_panics_with_a_literal_and_a_formatted_message`).
 - **One-shot commands run in `todo-mcp-cli`, never `todo-mcp`** (#9). It is a
   `cli`-profile service in `compose.yaml` that `extends: todo-mcp` with
   `logging: !override {driver: none}`, `ports: !reset []`, no restart and no
@@ -207,7 +215,7 @@ leaves, importing no crate module: clock, errors, logger, mcp, sem
   four permits through one 120 s backoff parks every other tool call.
 - **`panic = "unwind"`**, diverging from calendar-ics-mcp's `abort`: this is a
   long-lived multi-client server. It only pays for itself together with the panic
-  hook in `main.rs`, `catch_unwind` around the **whole worker loop** (not just the
+  hook (`logger::install_panic_hook`, installed first by `main`), `catch_unwind` around the **whole worker loop** (not just the
   handler body), and the poison policy above.
 - **`-T` on every `docker compose run` whose output is captured.** Compose allocates a
   TTY by default, and a TTY merges the container's stderr into the captured stdout, so
@@ -233,13 +241,15 @@ hand-rolls a fixture Entra/Graph server on `tiny_http` (already a dependency), s
    `tests/shutdown.rs` (`child_process_entry`, `TODO_MCP_SHUTDOWN_TEST_CHILD`),
    because a booted `serve` needs a live Entra; and the log-hygiene pairs in
    `tests/tools_read.rs` (`TODO_MCP_LOG_HYGIENE_CHILD`) and `tests/token_store.rs`
-   (`TODO_MCP_DELETION_LOG_CHILD`, the boot-vs-runtime deletion warning), because
+   (`TODO_MCP_DELETION_LOG_CHILD`, the boot-vs-runtime deletion warning), and the
+   panic-hook pair in `tests/http_auth.rs` (`TODO_MCP_PANIC_HOOK_CHILD`), because
    libtest does not capture `logger`'s writes to fd 2. None can pass vacuously on a
    filter typo: the log-hygiene parents assert the child's stdout says `1 passed`, and
    the shutdown tests wait for the child's own log lines before signalling it.
 
-**244 tests per run: 129 unit** (in the lib; `main.rs` has none) **and 115
-integration** — cli_smoke 14, graph_client 12, http_auth 2, shutdown 9 (one is the
+**251 tests per run: 134 unit** (in the lib; `main.rs` has none) **and 117
+integration** — cli_smoke 14, graph_client 12, http_auth 4 (one is the panic-hook
+child, a no-op outside it), shutdown 9 (one is the
 `child_process_entry` body, a no-op outside the child), token_store 19, tools_read 35,
 tools_write 24 — and 0 doctests. The count is the same under the host zone, under
 `TZ=Pacific/Kiritimati` and inside `docker build --target test .`.
@@ -250,6 +260,10 @@ Rules:
   real handler would `_exit(0)` the test runner on Ctrl-C and report a cancelled run
   as a success. Use a re-exec child, or `Shutdown::install_with` with a fake
   registrar. `cli/commands.rs` has exactly one `#[cfg(test)] mod tests`.
+- Never call `logger::install_panic_hook()` in-process in a test: the hook is
+  process-global, so every other test's panic would go to fd 2 as JSON instead of
+  libtest's captured output. Use a re-exec child; unit tests call `panic_payload` on
+  a `catch_unwind` payload.
 - No `unwrap_err()` on non-`Debug` types; use `let … else`.
 - No `"Authorization"` or `with_ymd_and_hms` in a `src/` test: gates 3 and 10 scan
   `src/`. `tests/` is fine.
@@ -388,7 +402,7 @@ and can print a task title.
 ## Status and where to start
 
 **Implemented and tested offline.** `auth/`, `graph/`, `domain/`, `cache.rs`,
-`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 244
+`tools/`, `server.rs`, `mcp.rs`, `http.rs` and the six subcommands exist. The 251
 tests (see Tests) pass under the host zone, under `TZ=Pacific/Kiritimati` and inside
 `docker build --target test .`, with clippy `-D warnings`, `cargo fmt --check` and
 the ten gates green.

@@ -16,7 +16,7 @@ nothing else.
 >
 > | | |
 > |---|---|
-> | **Test suite** | 244 tests (129 unit, 115 integration) against a hand-rolled fixture Entra/Graph server. Green under the host time zone and under `TZ=Pacific/Kiritimati`, and inside `docker build --target test .` |
+> | **Test suite** | 251 tests (134 unit, 117 integration) against a hand-rolled fixture Entra/Graph server. Green under the host time zone and under `TZ=Pacific/Kiritimati`, and inside `docker build --target test .` |
 > | **Release image** | Built for `linux/amd64` and `linux/arm64` through the size gate, and checked on macOS arm64 Docker Desktop: user `65534:65534`, `/data` volume, healthcheck, no shell. A compose run with a fake client ID showed a fresh named volume's `/data` owned `65534:65534` mode `0700` (Docker Desktop keeps named volumes on ext4 inside its Linux VM; only bind mounts go through VirtioFS), and the `Restarting (3)` refusal without a sign-in |
 > | **Linux** | CI's `Release image` job asserts that first-mount ownership again on the amd64 image on a native Linux engine, and is the only evidence for `docker stop` during boot exiting 0 within 2 s (as PID 1, no init). Stopping a running server, and its drain, are tested on the host by `tests/shutdown.rs` |
 > | **Never done** | A run against a real Microsoft account. The live-Graph assumptions — `$batch` on `/me/todo/*`, whether `null` clears a due date, which Windows zone names a date write accepts, the exact scopes Microsoft grants — are still assumptions. [CHANGELOG.md](CHANGELOG.md) lists them all |
@@ -45,7 +45,7 @@ That is enforced structurally, not editorially:
 | No secret, no daemon identity | Public client, no client secret. `TODO_MCP_CLIENT_SECRET` being set is a startup refusal. |
 | Tool surface follows the *actual* grant in default mode, capped by your config in follow mode | In default mode, write tools are registered only if the scope Microsoft reports in the token response (or, if it omits one, the scope requested) is `Tasks.ReadWrite` **and** `TODO_MCP_SCOPE` is `Tasks.ReadWrite`. With `TODO_MCP_START_WITHOUT_TOKEN=1`, `tools/list` is built from the `TODO_MCP_SCOPE` ceiling and dispatch enforces the live grant; a later widening or narrowing needs no restart. |
 | Never asks for your identity | `openid`, `profile` and `User.Read` are not requested, and the server never calls the profile endpoint `GET /me`: every Graph request it makes is under `/me/todo/`, directly or inside `$batch`. |
-| No task content in the server's logs | No line the server logs carries a task title, body, category, checklist item or list name. A list appears in logs only as an opaque `lst_…` hash (`cache::log_ref`), and a test re-runs its own binary to check the real stderr. [SECURITY.md](SECURITY.md#known-gaps) lists the known gaps. |
+| No task content in the server's logs | No line the server logs carries a task title, body, category, checklist item or list name. A list appears in logs only as an opaque `lst_…` hash (`cache::log_ref`), and a test re-runs its own binary to check the real stderr. A panic logs its message only when it is a string literal; a formatted one is logged by length ([SECURITY.md](SECURITY.md#what-this-server-can-and-cannot-do)). |
 | Task content never touches disk | The cache is memory-only. The volume holds `token.json` (the refresh token) and `bearer.token` (the MCP bearer), never your tasks. |
 
 The refresh token is stored **in plaintext** at `/data/token.json`, mode `0600`, in a
