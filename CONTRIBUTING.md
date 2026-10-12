@@ -86,8 +86,9 @@ before a merge. **`Hermetic gate`** is the build above plus the time-zone re-run
 `linux/amd64` and `linux/arm64` through the binary size gate, then smoke-tests the amd64
 image on Linux. The size gate lives in the Dockerfile's `size` stage, and
 `docker build --target release .` passes through it. If your change legitimately
-outgrows `SIZE_LIMIT`, update the measurement in [docs/footprint.md](docs/footprint.md)
-and the `ARG` together.
+outgrows `SIZE_LIMIT`, take the new figures from your pull request's `Release image`
+log (the `todo-mcp: N bytes` lines), then update the measurement in
+[docs/footprint.md](docs/footprint.md) and the `ARG` together.
 
 Every third-party action in `.github/` is pinned to a full 40-character commit SHA,
 with the release in a trailing comment (`uses: actions/checkout@<sha> # v7.0.1`); a

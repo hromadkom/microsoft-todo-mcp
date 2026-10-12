@@ -60,7 +60,10 @@ jobs:
 
       # `release` takes its binary from the `size` stage, so this build IS the
       # size gate; SIZE_LIMIT is the Dockerfile ARG default and nothing here
-      # overrides it. The gate only ever builds debug on glibc, so this is also
+      # overrides it. The `todo-mcp: N bytes` lines it prints are the figures
+      # the SIZE_LIMIT rule is applied to (docs/footprint.md), so changing
+      # runs-on or the builder changes the reference environment; record that
+      # there. The gate only ever builds debug on glibc, so this is also
       # the first CI exercise of panic="unwind" + LTO + opt-level="z" on musl,
       # and of USER, VOLUME, HEALTHCHECK and COPY --chmod.
       - name: Build release image + size gate (linux/amd64, linux/arm64)
