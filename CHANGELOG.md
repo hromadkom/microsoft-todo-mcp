@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **One-shot commands no longer leave their output on the Docker host.**
+  `compose.yaml` adds a `todo-mcp-cli` service (same image, volume, `.env` and
+  hardening, `cli` profile) with no log driver, and README, the compose comments and
+  the sign-in hint now run `login`, `doctor`, `token` and `logout` through it. Under
+  `docker compose run … todo-mcp`, the server's `json-file` driver wrote the device
+  code, the bearer, list names and a task title to disk until the container was
+  removed. Use `docker compose run --rm todo-mcp-cli <command>`. SECURITY.md records
+  the decision, including why `doctor`'s output is not narrowed. (#9)
 - **`serve` no longer logs Microsoft's `error_description` from a refused boot
   refresh.** The one line it logs now carries the AADSTS code (or the OAuth `error`
   string), this project's own summary and remediation, and the Trace ID and
