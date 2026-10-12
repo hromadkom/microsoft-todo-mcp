@@ -72,11 +72,13 @@ RUN mkdir -p /data && chown 65534:65534 /data && chmod 0700 /data
 # Size gate. `release` copies its binary from THIS stage, so every build of
 # `release` (CI, `docker compose build`, a hand-run `docker build`) enforces it.
 # The ARG default below is the only value: ci.yml passes no build-arg, and
-# nothing else should. SIZE_LIMIT = the larger of the amd64/arm64 musl binaries
-# x 1.25, rounded up to a multiple of 64 KiB. The measurements, date, toolchain
-# and exact commands are in docs/footprint.md; re-measure both arches with the
-# per-platform loop in docs/footprint.md (Commands), which passes
-# --no-cache-filter size (without it a cached stage prints no size line).
+# nothing else should. SIZE_LIMIT = the larger of the amd64/arm64 musl binaries,
+# as printed by CI's `Release image` job, x 1.25, rounded up to a multiple of
+# 64 KiB. The measurements, date, toolchain and exact commands are in
+# docs/footprint.md. Read the reference figures from that job's log; the
+# per-platform loop in docs/footprint.md (Commands) measures locally, where the
+# figure can differ by about half a kilobyte, and passes --no-cache-filter size
+# (without it a cached stage prints no size line).
 FROM build AS size
 ARG SIZE_LIMIT=4915200
 RUN bytes=$(stat -c%s /todo-mcp) \

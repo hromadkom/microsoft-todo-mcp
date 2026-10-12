@@ -273,8 +273,10 @@ are the required-check names, exactly:
   again inside that image under `TZ=Pacific/Kiritimati`.
 - **`Release image`** — builds `--target release` for linux/amd64 + arm64 without
   pushing. `release` copies its binary from `size`, so this is the size gate, at the
-  Dockerfile's `ARG SIZE_LIMIT` default (no build-arg is passed). It then loads the
-  amd64 image and smoke-tests it on Linux, as PID 1 with no init: `--version` matches
+  Dockerfile's `ARG SIZE_LIMIT` default (no build-arg is passed). The
+  `todo-mcp: N bytes` lines it prints are the figures the `SIZE_LIMIT` rule is applied
+  to (`docs/footprint.md`). It then loads the amd64 image and smoke-tests it on
+  Linux, as PID 1 with no init: `--version` matches
   Cargo.toml; the image config (user, `/data` volume, entrypoint, `serve`, port,
   healthcheck, no `TODO_MCP_CLIENT_ID` in Env); `--entrypoint sh` fails; the first
   mount of a fresh named volume gives a root of `65534:65534 700`, a `bearer.token` of
@@ -416,17 +418,27 @@ makes it exist, and `--chmod` is required — without it BuildKit's
 `MkdirAll(target, 0755, chown)` discards the builder's `chmod 0700`. It needs a volume
 (not a bind mount), its first mount, and an empty volume.
 
-**Binary size** (`docs/footprint.md`). Measured 2026-09-15 on macOS arm64 Docker
-Desktop, docker-driver builder, one platform per invocation: amd64 **3,931,280** bytes,
-arm64 **3,468,312** bytes, both static non-PIE (`ET_EXEC`, `od -An -tx1 -j16 -N2` gives
-`02 00`). The `FROM scratch` image is two layers and the same size as its binary.
-`ARG SIZE_LIMIT=4915200` follows one rule: **the larger of the amd64/arm64 musl
-binaries × 1.25, rounded up to a multiple of 64 KiB** (3,931,280 × 1.25 = 4,914,100 →
-4,915,200). Both release builds passed it. The ARG default is the only value; when you
-re-measure, update it and footprint.md in the same change. A cached `size` stage prints
-no size line, so pass `--no-cache-filter size --progress=plain`. The ~336 KB figure in
-early notes was a macOS build of the scaffold with rustls, ureq, tiny_http and
-chrono-tz dead-stripped — not a baseline.
+**Binary size** (`docs/footprint.md`). v0.1.0 (`7427917`) was built in two
+environments. On macOS arm64 Docker Desktop (2026-09-15; docker-driver builder, one
+platform per invocation) it measured amd64 **3,931,280** bytes and arm64 **3,468,312**.
+In CI's `Release image` job on `ubuntu-24.04` (2026-09-16) it measured amd64
+**3,931,792** and arm64 **3,467,800**. That is 512 bytes apart per target, in opposite
+directions. The cause has not been investigated; record it, do not guess one. The
+macOS builds were checked to be static non-PIE (`ET_EXEC`: `od -An -tx1 -j16 -N2`
+gives `02 00`). The `FROM scratch` image is two layers and the same size as its
+binary. `ARG SIZE_LIMIT=4915200` follows one rule: **the larger of the amd64/arm64
+musl binaries, as printed by CI's `Release image` job, × 1.25, rounded up to a
+multiple of 64 KiB**. The arithmetic is 3,931,792 × 1.25 = 4,914,740 → 4,915,200.
+The macOS 3,931,280 gives the same, but CI's product is only 460 bytes under the
+step. The rule is applied when a measurement is recorded, not on every build. Later
+trees are larger (`main` at `83732ef` printed 3,971,704 / 3,496,608, 80.8% of the
+limit), and the ARG stays until a deliberate ratchet. The ARG default is the only
+value; when you ratchet, update it, footprint.md and this paragraph in the same
+change. Read the CI figures from the job log (footprint.md § Commands). A cached
+`size` stage prints no size line, in CI or locally, so a local build needs
+`--no-cache-filter size --progress=plain`. The ~336 KB figure in early notes was a
+macOS build of the scaffold with rustls, ureq, tiny_http and chrono-tz dead-stripped
+— not a baseline.
 
 **Run against a live Microsoft account once** (2026-09-22, one work-or-school
 account on a single-tenant registration; `docs/graph-probe.md` is the redacted log,
