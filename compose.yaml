@@ -7,10 +7,14 @@
 # TODO_MCP_CLIENT_ID (see docs/app-registration.md):
 #
 #   docker compose pull todo-mcp
-#   docker compose run --rm todo-mcp login    # one-time device-code sign-in; no TTY needed
-#   docker compose run --rm todo-mcp doctor   # prints list names and can print a task title: redact before sharing
+#   docker compose run --rm todo-mcp-cli login    # one-time device-code sign-in; no TTY needed
+#   docker compose run --rm todo-mcp-cli doctor   # prints list names and can print a task title: redact before sharing
 #   docker compose up -d todo-mcp
-#   BEARER="$(docker compose run --rm -T todo-mcp token)"   # the MCP bearer, kept in a shell variable
+#   BEARER="$(docker compose run --rm -T todo-mcp-cli token)"   # the MCP bearer, kept in a shell variable
+#
+# One-shot commands go through todo-mcp-cli, never todo-mcp: it has no log driver,
+# so the device code, list names and bearer they print are not written to the
+# Docker host's disk (see the service below).
 #
 # then have your MCP client send `Authorization: Bearer $BEARER` (README.md, Quick
 # start). Do not redirect the bearer into a file in this checkout: it is a live
@@ -93,6 +97,23 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+  # The one-shot commands (login, doctor, token, logout). Same image, volume,
+  # .env and hardening as todo-mcp, but with no log driver: `login` prints a
+  # device code, `doctor` your list names and a task title, `token` the bearer,
+  # and the json-file driver above would write that stdout to the Docker host's
+  # disk. Here it reaches only your terminal, and `docker compose logs` has
+  # nothing for this service, by design (SECURITY.md). The profile keeps a bare
+  # `docker compose up` from starting it; `docker compose run` targets it anyway.
+  todo-mcp-cli:
+    extends: todo-mcp
+    profiles: [cli]
+    logging: !override
+      driver: none
+    ports: !reset []
+    restart: "no"
+    healthcheck:
+      disable: true
 
   # Dockerized Rust toolchain — the canonical way to run cargo in this repo, so
   # no host Rust toolchain is assumed:

@@ -153,7 +153,7 @@ already there — so copy first, then **set** the line rather than appending a s
 one. Then sign in:
 
 ```bash
-docker compose run --rm todo-mcp login
+docker compose run --rm todo-mcp-cli login
 ```
 
 `login` prints a URL and a code. Open the URL, enter the code, approve the consent

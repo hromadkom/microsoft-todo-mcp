@@ -189,19 +189,40 @@ The shipped `compose.yaml` adds:
 | `pids_limit: 64`, `cpus: 1.0` | resource ceilings |
 | `init: true` | the server is not PID 1, so signals are forwarded and delivered |
 | `logging: json-file`, `max-size 10m`, `max-file 3` | bounded logs |
+| a `todo-mcp-cli` service with `logging: driver: none` | `login`, `doctor`, `token` and `logout` print to your terminal only ([below](#one-shot-commands-run-without-a-log-driver)) |
 
 A plain `docker run` applies none of the compose keys; add the equivalent flags
 yourself. In-memory secrets are zeroed on drop only on a best-effort basis: without
 the `zeroize` crate the optimiser may skip it, so erasure is not guaranteed.
 
-## `doctor` and `login` print to stdout, and Docker may keep it
+## One-shot commands run without a log driver
 
-`doctor` prints your list names and, when `TODO_MCP_TZ` is set, one real task's title,
-next to its raw and interpreted due date. `login` prints Microsoft's device-code message: the sign-in URL
-and a code that can complete the sign-in until it expires. Under `docker compose run`,
-the service's `json-file` log driver records that stdout. It stays on the Docker host
-until the `--rm` container is removed. If that matters, run `doctor` with the host
-binary, or bypass the log driver with the same volume and `.env`:
+Three one-shot commands print something that must not be kept: `login` prints
+Microsoft's device-code message, a sign-in URL and a code that completes the sign-in
+for whoever has it until it expires; `token` prints the MCP bearer; `doctor` prints
+your list names and, when `TODO_MCP_TZ` is set, one real task's title next to its raw
+and interpreted due date.
+
+**Decision: the shipped `compose.yaml` runs them in their own service,
+`todo-mcp-cli`, with `logging: driver: none`.** It extends `todo-mcp` (same image,
+`.env`, `todo-mcp-state` volume, user and hardening), drops the published port,
+restart policy and healthcheck, and sits behind the `cli` profile so a bare
+`docker compose up` never starts it. `docker compose run` attaches to the container's
+output directly, so the command still prints to your terminal, but nothing is written
+to the Docker host's disk, and `docker compose logs` has nothing for it.
+`docker compose run` has no `--log-driver` flag, which is why this is a service and
+not an option on the command. Every command in README, `compose.yaml`'s first-run
+comments and the server's own sign-in hint (`LOGIN_HINT`) uses `todo-mcp-cli`.
+Running a one-shot as `docker compose run … todo-mcp <command>` still works, but goes
+through the server's `json-file` driver, and the output stays on the host until the
+container is removed (for good, without `--rm`).
+
+`doctor`'s output is deliberately **not** narrowed: the list names show that Graph
+access works and which lists the server sees, and the `date check:` line, with its
+task title, is the only way to notice a valid but wrong `TODO_MCP_TZ`. What remains is
+your terminal's scrollback and anything you pipe the output into.
+
+Without compose, keep the same property with `--log-driver none` on `docker run`:
 
 ```bash
 docker run --rm --log-driver none --env-file .env \

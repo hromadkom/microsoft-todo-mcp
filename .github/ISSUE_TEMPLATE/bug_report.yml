@@ -31,11 +31,11 @@ body:
     attributes:
       label: Failing command or tool call
       description: |
-        The exact command (for example `docker compose run --rm todo-mcp login`), or the MCP
+        The exact command (for example `docker compose run --rm todo-mcp-cli login`), or the MCP
         tool name and its arguments. Replace task titles and list names with placeholders.
       render: text
       placeholder: |
-        docker compose run --rm todo-mcp doctor
+        docker compose run --rm todo-mcp-cli doctor
 
         or
 
@@ -47,7 +47,7 @@ body:
     id: version
     attributes:
       label: Version
-      description: "`docker compose run --rm todo-mcp --version`, or the image tag. `GET /healthz` and the `initialize` response's `serverInfo` report it too."
+      description: "`docker compose run --rm todo-mcp-cli --version`, or the image tag. `GET /healthz` and the `initialize` response's `serverInfo` report it too."
       placeholder: "todo-mcp 1.0.1"
     validations:
       required: true

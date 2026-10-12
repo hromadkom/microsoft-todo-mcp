@@ -10,9 +10,9 @@
 use std::fmt;
 
 /// How to sign in, phrased for both deployments the README documents: a host
-/// binary, and the shipped compose.yaml (whose service is also named `todo-mcp`).
+/// binary, and the shipped compose.yaml (whose one-shot service is `todo-mcp-cli`).
 /// The one place this wording lives; errors, `doctor` and tool results use it.
-pub const LOGIN_HINT: &str = "run `todo-mcp login` (with the shipped compose.yaml: `docker compose run --rm todo-mcp login`)";
+pub const LOGIN_HINT: &str = "run `todo-mcp login` (with the shipped compose.yaml: `docker compose run --rm todo-mcp-cli login`)";
 
 /// How to restart the server, phrased the same way. Starts a sentence.
 pub const RESTART_HINT: &str =
@@ -239,7 +239,7 @@ mod tests {
         let msg = AppError::NotLoggedIn.message();
         assert!(msg.contains("`todo-mcp login`"), "{msg}");
         assert!(
-            msg.contains("`docker compose run --rm todo-mcp login`"),
+            msg.contains("`docker compose run --rm todo-mcp-cli login`"),
             "{msg}"
         );
         assert!(RESTART_HINT.contains("`docker compose restart todo-mcp`"));

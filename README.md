@@ -132,22 +132,28 @@ cp .env.example .env            # set TODO_MCP_CLIENT_ID; uncomment TODO_MCP_TZ 
 docker compose pull todo-mcp
 
 # 1. one-time sign-in (prints a URL and a code; finish in a browser)
-docker compose run --rm todo-mcp login
+docker compose run --rm todo-mcp-cli login
 
 # 2. sanity check: config, token state, granted scopes, your lists, a due-date sample
 #    (it prints your list names and can print a task title: redact before sharing)
-docker compose run --rm todo-mcp doctor
+docker compose run --rm todo-mcp-cli doctor
 
 # 3. run it
 docker compose up -d todo-mcp
 
 # 4. point Claude Code at it (-T is required — see below)
 claude mcp add --transport http todo http://127.0.0.1:8591/mcp \
-  --header "Authorization: Bearer $(docker compose run --rm -T todo-mcp token)"
+  --header "Authorization: Bearer $(docker compose run --rm -T todo-mcp-cli token)"
 ```
 
 Then ask: *"what's on my task lists?"* or *"plan my day"*. (`docker compose build
 todo-mcp` instead builds the same image from your checkout.)
+
+`todo-mcp-cli` is the same image, volume, `.env` and hardening as the `todo-mcp`
+server, with no log driver. Run every one-shot command (`login`, `doctor`, `token`,
+`logout`) through it: the device code, list names and bearer they print then reach
+your terminal only, where the server's `json-file` driver would write them to the
+Docker host's disk ([SECURITY.md](SECURITY.md#one-shot-commands-run-without-a-log-driver)).
 
 The order matters. `serve` refuses to start until `login` has written a token (exit 3,
 `AUTH_REQUIRED`), and `restart: unless-stopped` turns any startup refusal into a loop
@@ -184,7 +190,7 @@ volume holds both); use `docker compose down`.
 > `Authorization` header. (`token` prints no trailing newline, and the server trims
 > whitespace around the bearer, so the TTY's `\r\n` rewrite is not the problem.) If
 > `token` fails, the substitution is empty and every request gets a 401:
-> `docker compose run --rm -T todo-mcp token | wc -c` should print 64.
+> `docker compose run --rm -T todo-mcp-cli token | wc -c` should print 64.
 
 Without Docker, a host toolchain works the same way. `cargo run --release -- <command>`
 is the same as `todo-mcp <command>`, the form every hint the server prints uses
@@ -224,7 +230,7 @@ If a client can only speak stdio, the answer is a user-run bridge you install, n
 a transport in this codebase:
 
 ```bash
-export AUTH_HEADER="Bearer $(docker compose run --rm -T todo-mcp token)"
+export AUTH_HEADER="Bearer $(docker compose run --rm -T todo-mcp-cli token)"
 npx -y mcp-remote http://127.0.0.1:8591/mcp --allow-http --transport http-only \
   --header "Authorization:${AUTH_HEADER}"
 ```
@@ -281,12 +287,11 @@ exits 1 when it found something, and never refuses to run. Each invalid setting 
 own finding, and the report goes on with the data directory and token store checks; the
 Microsoft Graph check is skipped, saying why, while the client ID, tenant, scope or data
 directory is invalid, and an invalid `TODO_MCP_DATA_DIR` skips the data directory and
-token store checks too. Under `docker compose run`, the service's `json-file` log driver
-records that output on the Docker host until the `--rm` container is removed; to avoid
-it, run `doctor` from a host build or with `docker run --rm --log-driver none`
-([SECURITY.md](SECURITY.md#doctor-and-login-print-to-stdout-and-docker-may-keep-it)
-has the command). **Redact the list names and any task title before pasting `doctor`
-output anywhere.**
+token store checks too. Run it as `docker compose run --rm todo-mcp-cli doctor`, which
+has no log driver, so the report is not kept on the Docker host; `docker compose run
+… todo-mcp doctor` would go through the server's `json-file` driver
+([SECURITY.md](SECURITY.md#one-shot-commands-run-without-a-log-driver)). **Redact the
+list names and any task title before pasting `doctor` output anywhere.**
 
 ### Exit codes
 
@@ -323,7 +328,7 @@ was already under way when you ran `logout`, and it will not start again (exit 3
 until the next `login`, unless `TODO_MCP_START_WITHOUT_TOKEN=1`.
 
 ```bash
-docker compose run --rm todo-mcp logout
+docker compose run --rm todo-mcp-cli logout
 docker compose stop todo-mcp
 ```
 
@@ -336,7 +341,7 @@ until that restart.
 # with the shipped compose.yaml (the image has no shell, so borrow busybox for the rm)
 docker run --rm -v microsoft-todo-mcp_todo-mcp-state:/data busybox rm /data/bearer.token
 docker compose restart todo-mcp
-docker compose run --rm -T todo-mcp token
+docker compose run --rm -T todo-mcp-cli token
 
 # host toolchain
 rm "$TODO_MCP_DATA_DIR/bearer.token"   # or wherever TODO_MCP_BEARER_FILE points
