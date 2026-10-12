@@ -25,7 +25,8 @@ updates:
   # Actions used by the workflows and by the composite actions they call.
   # `directory: "/"` would cover `.github/workflows` and a root `action.yml`
   # only — the pins inside `.github/actions/*/action.yml` would silently stop
-  # being updated, so those paths are listed explicitly.
+  # being updated, so those paths are listed explicitly. Pins are full commit
+  # SHAs with the release in a trailing comment; Dependabot bumps both.
   - package-ecosystem: github-actions
     directories:
       - "/"

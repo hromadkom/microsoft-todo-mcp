@@ -89,6 +89,13 @@ image on Linux. The size gate lives in the Dockerfile's `size` stage, and
 outgrows `SIZE_LIMIT`, update the measurement in [docs/footprint.md](docs/footprint.md)
 and the `ARG` together.
 
+Every third-party action in `.github/` is pinned to a full 40-character commit SHA,
+with the release in a trailing comment (`uses: actions/checkout@<sha> # v7.0.1`); a
+tag can be moved, a SHA cannot. Take the SHA from the action's own repository, e.g.
+`gh api repos/actions/checkout/commits/v7.0.1 --jq .sha`, never from a third party.
+Dependabot bumps the SHA and the comment together. Local `./.github/actions/…`
+references stay as they are: they resolve from the checked-out tree.
+
 ### The gates are documentation
 
 `scripts/gates.sh` holds ten structural invariants that the type system cannot express.
