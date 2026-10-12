@@ -76,6 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handshake on a worker thread works, idle RSS measured. Tool descriptions now say
   that Graph derives the dates of a recurring task from `range.startDate` and that
   clearing the due date also removes the start date and recurrence.
+- `docs/footprint.md` records v0.1.0's binary sizes as built by CI (`ubuntu-24.04`)
+  beside the macOS ones. They are 512 bytes apart per target, in opposite directions,
+  and the cause has not been investigated. The `SIZE_LIMIT` rule is now applied to
+  the CI `Release image` job's figures; the limit stays 4,915,200. (#6)
 
 ## [1.0.1] - 2026-09-22
 
