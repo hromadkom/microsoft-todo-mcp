@@ -1,5 +1,5 @@
 //! The HTTP guards, in order, against a real listening server; plus panic
-//! isolation and the one test that proves token separation.
+//! isolation, what a panic logs, and the one test that proves token separation.
 
 mod common;
 
@@ -252,4 +252,69 @@ fn a_handler_panic_is_isolated_and_the_worker_survives() {
         assert_eq!(s, 200);
         assert!(v["result"].is_object(), "worker died after a panic: {v}");
     }
+}
+
+const PANIC_HOOK_CHILD: &str = "TODO_MCP_PANIC_HOOK_CHILD";
+const PANIC_TITLE: &str = "Zebra crossing rehearsal 7f3a";
+
+/// A panic line keeps a literal message but never a formatted one, which could
+/// carry a task title. `logger` writes straight to fd 2, which libtest does not
+/// capture, and the hook is process-global, so this re-runs THIS binary as a
+/// child with `env_clear()` and reads the child's real stderr.
+#[test]
+fn a_formatted_panic_message_never_reaches_stderr() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env(PANIC_HOOK_CHILD, "1")
+        .args([
+            "--exact",
+            "child_panics_with_a_literal_and_a_formatted_message",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+    // Proves the child really ran (a filter typo would run zero tests and pass).
+    assert!(stdout.contains("1 passed"), "child did not run:\n{stdout}");
+    let panics: Vec<Value> = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["msg"] == "panic")
+        .collect();
+    let [literal, formatted] = panics.as_slice() else {
+        panic!("expected two panic lines:\n{stderr}");
+    };
+    for line in [literal, formatted] {
+        let location = line["location"].as_str().unwrap_or_default();
+        assert!(location.starts_with("tests/http_auth.rs:"), "{line}");
+        assert!(line.get("thread").is_some(), "{line}");
+    }
+    assert_eq!(literal["payload"], "a literal panic message", "{literal}");
+    assert!(formatted.get("payload").is_none(), "{formatted}");
+    assert_eq!(
+        formatted["payload_bytes"],
+        "cannot render ".len() + PANIC_TITLE.len(),
+        "{formatted}"
+    );
+    assert!(
+        !stderr.contains(PANIC_TITLE),
+        "the title reached stderr:\n{stderr}"
+    );
+}
+
+/// Runs only as the parent's child; a no-op in the normal suite.
+#[test]
+fn child_panics_with_a_literal_and_a_formatted_message() {
+    if std::env::var_os(PANIC_HOOK_CHILD).is_none() {
+        return;
+    }
+    microsoft_todo_mcp::logger::install_panic_hook();
+    // Inline, not `panic!("{}", CONST)`: only an argument-free format string makes
+    // a `&'static str` payload.
+    assert!(std::panic::catch_unwind(|| panic!("a literal panic message")).is_err());
+    let title = String::from(PANIC_TITLE);
+    assert!(std::panic::catch_unwind(move || panic!("cannot render {title}")).is_err());
 }

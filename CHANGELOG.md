@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A panic no longer logs a formatted message.** The panic line keeps its source
+  location and thread, and its message only when that message is a string literal
+  (`panic!("…")` without arguments, `assert!`, `unreachable!()`). Any other message is
+  logged as its length in bytes, as `payload_bytes`: it can hold whatever was being
+  formatted, which a future bug could make a task title, and the compose
+  `json-file` driver persists stderr. This includes `expect` and `Result::unwrap`
+  messages, which the standard library formats; the location still names the call.
+  SECURITY.md records the policy in place of the former "Known gaps" bullet. (#7)
 - **One-shot commands no longer leave their output on the Docker host.**
   `compose.yaml` adds a `todo-mcp-cli` service (same image, volume, `.env` and
   hardening, `cli` profile) with no log driver, and README, the compose comments and
