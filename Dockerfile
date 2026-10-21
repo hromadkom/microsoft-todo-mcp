@@ -9,7 +9,7 @@
 # `od -An -tx1 -j16 -N2` on 2026-09-15 (docs/footprint.md). The executable image
 # itself has no ASLR on either arch; the kernel still randomises stack and mmap.
 # That is accepted, not overlooked.
-FROM --platform=$BUILDPLATFORM ghcr.io/rust-cross/cargo-zigbuild:0.23.4 AS base
+FROM --platform=$BUILDPLATFORM ghcr.io/rust-cross/cargo-zigbuild:0.24.0 AS base
 WORKDIR /app
 COPY rust-toolchain.toml ./
 ARG TARGETPLATFORM
